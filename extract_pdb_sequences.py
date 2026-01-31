@@ -109,9 +109,7 @@ def main() -> None:
     with out_path.open("w") as f:
         for header, seq in all_seqs:
             f.write(header + "\n")
-            # Wrap at 60 chars
-            for i in range(0, len(seq), 60):
-                f.write(seq[i:i+60] + "\n")
+            f.write(seq + "\n")
 
     lengths = [len(seq) for _, seq in all_seqs]
     stats = {
