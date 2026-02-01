@@ -8,6 +8,7 @@ import sys
 import os
 import time
 import multiprocessing as mp
+import signal
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from functools import lru_cache
 from typing import List, Tuple
@@ -34,9 +35,15 @@ _GLOBAL_DISORDER_THR: float = 0.5
 _GLOBAL_MAX_FRAC: float = 0.5
 _GLOBAL_MAX_RUN: int = 60
 _GLOBAL_MAX_MEAN: float = 0.5
+_GLOBAL_TIMEOUT_S: int = 0
 
 
 def _pair_worker(pair):
+    if _GLOBAL_TIMEOUT_S > 0:
+        def _alarm_handler(_signum, _frame):
+            raise TimeoutError("pair timeout")
+        signal.signal(signal.SIGALRM, _alarm_handler)
+        signal.alarm(_GLOBAL_TIMEOUT_S)
     line_no, id1, id2, idx1, idx2, lev = pair
     if idx1 >= len(_GLOBAL_SEQS) or idx2 >= len(_GLOBAL_SEQS):
         return (line_no, id1, id2, idx1, idx2, "invalid_index", None, None, None)
@@ -60,12 +67,18 @@ def _pair_worker(pair):
             return False
         return validator(chain)
 
-    steps, operations, distance = dsc.algo_seq_dynamic_with_validation_run(
-        a_seq,
-        b_seq,
-        validator=iupred_validator,
-    )
-    return (line_no, id1, id2, idx1, idx2, "ok", steps, operations, distance)
+    try:
+        steps, operations, distance = dsc.algo_seq_dynamic_with_validation_run(
+            a_seq,
+            b_seq,
+            validator=iupred_validator,
+        )
+        return (line_no, id1, id2, idx1, idx2, "ok", steps, operations, distance)
+    except TimeoutError:
+        return (line_no, id1, id2, idx1, idx2, "timeout", None, None, None)
+    finally:
+        if _GLOBAL_TIMEOUT_S > 0:
+            signal.alarm(0)
 
 
 @lru_cache(maxsize=10000)
@@ -164,6 +177,7 @@ def main() -> int:
     parser.add_argument("--max-disordered-run", type=int, default=60, help="Reject if max consecutive disordered run is >= this")
     parser.add_argument("--max-mean-score", type=float, default=0.5, help="Reject if mean IUPred score is higher")
     parser.add_argument("--max-lev", type=int, default=0, help="Skip pairs with lev above this (0 = no limit)")
+    parser.add_argument("--pair-timeout", type=int, default=0, help="Timeout per pair in seconds (0 = no limit)")
     args = parser.parse_args()
 
     layers_dir = pathlib.Path(args.layers_dir)
@@ -209,14 +223,16 @@ def main() -> int:
             found = 0
             not_found = 0
             invalid_index = 0
+            timeouts = 0
 
-            global _GLOBAL_SEQS, _GLOBAL_PROB, _GLOBAL_SEED, _GLOBAL_NO_VALIDATOR
+            global _GLOBAL_SEQS, _GLOBAL_PROB, _GLOBAL_SEED, _GLOBAL_NO_VALIDATOR, _GLOBAL_TIMEOUT_S
             global _GLOBAL_IUPRED_MODE, _GLOBAL_IUPRED_SMOOTH, _GLOBAL_DISORDER_THR
             global _GLOBAL_MAX_FRAC, _GLOBAL_MAX_RUN, _GLOBAL_MAX_MEAN
             _GLOBAL_SEQS = seqs
             _GLOBAL_PROB = args.validator_prob
             _GLOBAL_SEED = args.seed
             _GLOBAL_NO_VALIDATOR = args.no_validator
+            _GLOBAL_TIMEOUT_S = args.pair_timeout
             _GLOBAL_IUPRED_MODE = args.iupred_mode
             _GLOBAL_IUPRED_SMOOTH = args.iupred_smoothing
             _GLOBAL_DISORDER_THR = args.disorder_threshold
@@ -253,7 +269,11 @@ def main() -> int:
                             continue
 
                         if steps is None:
-                            results_f.write(f"{layer}\t{line_no}\t{idx1}\t{idx2}\t{id1}\t{id2}\tnot_found\t\t\t0\n")
+                            if status == "timeout":
+                                results_f.write(f"{layer}\t{line_no}\t{idx1}\t{idx2}\t{id1}\t{id2}\ttimeout\t\t\t0\n")
+                                timeouts += 1
+                            else:
+                                results_f.write(f"{layer}\t{line_no}\t{idx1}\t{idx2}\t{id1}\t{id2}\tnot_found\t\t\t0\n")
                             not_found += 1
                             continue
 
@@ -275,7 +295,8 @@ def main() -> int:
 
             print(
                 f"[run_pair_validations] layer {layer}: done "
-                f"(processed={processed}, found={found}, not_found={not_found}, invalid_index={invalid_index}, skipped={skipped})"
+                f"(processed={processed}, found={found}, not_found={not_found}, timeout={timeouts}, invalid_index={invalid_index}, skipped={skipped})",
+                flush=True,
             )
 
     print(f"[run_pair_validations] done. Results: {results_path}")
