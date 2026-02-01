@@ -206,6 +206,9 @@ def main() -> int:
             processed = 0
             last_update = 0.0
             start_time = time.time()
+            found = 0
+            not_found = 0
+            invalid_index = 0
 
             global _GLOBAL_SEQS, _GLOBAL_PROB, _GLOBAL_SEED, _GLOBAL_NO_VALIDATOR
             global _GLOBAL_IUPRED_MODE, _GLOBAL_IUPRED_SMOOTH, _GLOBAL_DISORDER_THR
@@ -231,13 +234,10 @@ def main() -> int:
             with executor as ex:
                 futures = []
                 for pair in pairs_to_run:
-                    line_no, id1, id2, idx1, idx2, lev = pair
-                    print(f"[run_pair_validations] start pair line={line_no} idx1={idx1} idx2={idx2} id1={id1} id2={id2} lev={lev}")
                     futures.append(ex.submit(_pair_worker, pair))
                 try:
                     for fut in as_completed(futures):
                         line_no, id1, id2, idx1, idx2, status, steps, operations, distance = fut.result()
-                        print(f"[run_pair_validations] done pair line={line_no} idx1={idx1} idx2={idx2} status={status}")
                         processed += 1
                         now = time.time()
                         if now - last_update >= args.progress_interval or processed == total_pairs:
@@ -249,15 +249,18 @@ def main() -> int:
 
                         if status == "invalid_index":
                             results_f.write(f"{layer}\t{line_no}\t{idx1}\t{idx2}\t{id1}\t{id2}\tinvalid_index\t\t\t0\n")
+                            invalid_index += 1
                             continue
 
                         if steps is None:
                             results_f.write(f"{layer}\t{line_no}\t{idx1}\t{idx2}\t{id1}\t{id2}\tnot_found\t\t\t0\n")
+                            not_found += 1
                             continue
 
                         ops_json = json.dumps(operations, ensure_ascii=True)
                         steps_count = len(steps)
                         results_f.write(f"{layer}\t{line_no}\t{idx1}\t{idx2}\t{id1}\t{id2}\tfound\t{distance}\t{ops_json}\t{steps_count}\n")
+                        found += 1
 
                         for i, step in enumerate(steps):
                             fasta_f.write(f">layer{layer}|pair{line_no}|idx1={idx1}|idx2={idx2}|step={i}|distance={distance}\n")
@@ -270,7 +273,10 @@ def main() -> int:
                     print("[run_pair_validations] shutdown complete")
                     return 1
 
-            print(f"[run_pair_validations] layer {layer}: done (skipped={skipped})")
+            print(
+                f"[run_pair_validations] layer {layer}: done "
+                f"(processed={processed}, found={found}, not_found={not_found}, invalid_index={invalid_index}, skipped={skipped})"
+            )
 
     print(f"[run_pair_validations] done. Results: {results_path}")
     print(f"[run_pair_validations] new sequences: {new_fasta_path}")
