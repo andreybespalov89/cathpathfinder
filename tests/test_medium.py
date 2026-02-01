@@ -1,7 +1,7 @@
 import pytest
 import datasetgradualstep_c.datasetgradualstep_c as dsc
 
-def test_algo_reverse(): #Тест на замену одной буквы на другую
+def test_algo_reverse(): #Тест на реверс
     def custom_validator(chain):
         return True
     a_seq = "ABCDE"
