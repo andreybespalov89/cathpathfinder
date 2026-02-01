@@ -2,13 +2,14 @@
 #include <Python.h>
 #include <stdlib.h>
 #include <string.h>
-
+#include <time.h>
+#include <stdio.h>
 
 typedef enum {
     OP_MATCH = 0,
     OP_REPLACE = 1,
     OP_INSERT = 2,
-    OP_DELETE = 3,
+    OP_DELETE = 3
 } OpType;
 
 typedef struct {
@@ -100,7 +101,6 @@ op_to_tuple(const Op *op) {
             Py_DECREF(ch);
             break;
         }
-        
         default:
             PyErr_SetString(PyExc_RuntimeError, "Unknown op type");
             return NULL;
@@ -536,8 +536,226 @@ typedef struct {
     PyObject *steps_found;
     Op *stack;
     Py_ssize_t max_ops;
-    int *dp; 
+    int verbose;
+    Py_ssize_t nodes_visited;
+    Py_ssize_t validations;
+    Py_ssize_t validation_failures;
+    Py_ssize_t steps_checked;
+    Py_ssize_t log_every;
+    Py_ssize_t log_fail_limit;
+    Py_ssize_t max_nodes;
+    Py_ssize_t beam_size;
 } SearchCtx;
+
+typedef struct SeqBuf {
+    Py_UCS4 *data;
+    Py_ssize_t len;
+    int refcnt;
+} SeqBuf;
+
+static SeqBuf *seqbuf_new(const Py_UCS4 *src, Py_ssize_t len) {
+    SeqBuf *sb = (SeqBuf *)PyMem_Malloc(sizeof(SeqBuf));
+    if (!sb) return NULL;
+    sb->data = (Py_UCS4 *)PyMem_Malloc(sizeof(Py_UCS4) * (size_t)len);
+    if (!sb->data) {
+        PyMem_Free(sb);
+        return NULL;
+    }
+    memcpy(sb->data, src, sizeof(Py_UCS4) * (size_t)len);
+    sb->len = len;
+    sb->refcnt = 1;
+    return sb;
+}
+
+static void seqbuf_inc(SeqBuf *sb) {
+    if (sb) sb->refcnt += 1;
+}
+
+static void seqbuf_dec(SeqBuf *sb) {
+    if (!sb) return;
+    sb->refcnt -= 1;
+    if (sb->refcnt <= 0) {
+        PyMem_Free(sb->data);
+        PyMem_Free(sb);
+    }
+}
+
+static SeqBuf *seqbuf_apply(const SeqBuf *src, OpType type, Py_UCS4 b, Py_ssize_t pos, Py_ssize_t *out_pos) {
+    if (type == OP_MATCH) {
+        *out_pos = pos + 1;
+        return (SeqBuf *)src;
+    }
+    if (type == OP_REPLACE) {
+        if (pos < 0 || pos >= src->len) return NULL;
+        SeqBuf *sb = seqbuf_new(src->data, src->len);
+        if (!sb) return NULL;
+        sb->data[pos] = b;
+        *out_pos = pos + 1;
+        return sb;
+    }
+    if (type == OP_INSERT) {
+        if (pos < 0 || pos > src->len) return NULL;
+        SeqBuf *sb = (SeqBuf *)PyMem_Malloc(sizeof(SeqBuf));
+        if (!sb) return NULL;
+        sb->data = (Py_UCS4 *)PyMem_Malloc(sizeof(Py_UCS4) * (size_t)(src->len + 1));
+        if (!sb->data) {
+            PyMem_Free(sb);
+            return NULL;
+        }
+        memcpy(sb->data, src->data, sizeof(Py_UCS4) * (size_t)pos);
+        sb->data[pos] = b;
+        memcpy(sb->data + pos + 1, src->data + pos, sizeof(Py_UCS4) * (size_t)(src->len - pos));
+        sb->len = src->len + 1;
+        sb->refcnt = 1;
+        *out_pos = pos + 1;
+        return sb;
+    }
+    if (type == OP_DELETE) {
+        if (pos < 0 || pos >= src->len) return NULL;
+        SeqBuf *sb = (SeqBuf *)PyMem_Malloc(sizeof(SeqBuf));
+        if (!sb) return NULL;
+        sb->data = (Py_UCS4 *)PyMem_Malloc(sizeof(Py_UCS4) * (size_t)(src->len - 1));
+        if (!sb->data) {
+            PyMem_Free(sb);
+            return NULL;
+        }
+        memcpy(sb->data, src->data, sizeof(Py_UCS4) * (size_t)pos);
+        memcpy(sb->data + pos, src->data + pos + 1, sizeof(Py_UCS4) * (size_t)(src->len - pos - 1));
+        sb->len = src->len - 1;
+        sb->refcnt = 1;
+        *out_pos = pos;
+        return sb;
+    }
+    return NULL;
+}
+
+typedef struct {
+    Py_ssize_t i;
+    Py_ssize_t j;
+    Py_ssize_t pos;
+    int g;
+    int f;
+    int parent;
+    Op op;
+    struct SeqBuf *seq;
+} BFNode;
+
+typedef struct {
+    int *heap;
+    size_t size;
+    size_t cap;
+    BFNode *nodes;
+    size_t nodes_size;
+    size_t nodes_cap;
+    size_t beam_limit;
+} BFQueue;
+
+static int bfq_cmp(const BFNode *a, const BFNode *b) {
+    if (a->f != b->f) return a->f < b->f;
+    return a->g < b->g;
+}
+
+static int bfq_init(BFQueue *q, size_t cap) {
+    q->heap = (int *)PyMem_Malloc(sizeof(int) * cap);
+    if (!q->heap) return 0;
+    q->size = 0;
+    q->cap = cap;
+    q->nodes = (BFNode *)PyMem_Malloc(sizeof(BFNode) * cap);
+    if (!q->nodes) {
+        PyMem_Free(q->heap);
+        return 0;
+    }
+    q->nodes_size = 0;
+    q->nodes_cap = cap;
+    q->beam_limit = 0;
+    return 1;
+}
+
+static void bfq_free(BFQueue *q) {
+    if (!q) return;
+    PyMem_Free(q->heap);
+    PyMem_Free(q->nodes);
+    q->heap = NULL;
+    q->nodes = NULL;
+    q->size = 0;
+    q->cap = 0;
+    q->nodes_size = 0;
+    q->nodes_cap = 0;
+}
+
+static int bfq_push_node(BFQueue *q, BFNode node) {
+    if (q->beam_limit > 0 && q->size >= q->beam_limit) {
+        return 1;
+    }
+    if (q->nodes_size >= q->nodes_cap) {
+        size_t new_cap = q->nodes_cap ? q->nodes_cap * 2 : 1024;
+        BFNode *nn = (BFNode *)PyMem_Realloc(q->nodes, sizeof(BFNode) * new_cap);
+        if (!nn) return 0;
+        q->nodes = nn;
+        q->nodes_cap = new_cap;
+    }
+    int idx = (int)q->nodes_size;
+    q->nodes[q->nodes_size++] = node;
+    if (q->size >= q->cap) {
+        size_t new_cap = q->cap ? q->cap * 2 : 1024;
+        int *nh = (int *)PyMem_Realloc(q->heap, sizeof(int) * new_cap);
+        if (!nh) return 0;
+        q->heap = nh;
+        q->cap = new_cap;
+    }
+    size_t i = q->size++;
+    q->heap[i] = idx;
+    while (i > 0) {
+        size_t p = (i - 1) / 2;
+        BFNode *ni = &q->nodes[q->heap[i]];
+        BFNode *np = &q->nodes[q->heap[p]];
+        if (bfq_cmp(np, ni)) break;
+        int tmp = q->heap[i];
+        q->heap[i] = q->heap[p];
+        q->heap[p] = tmp;
+        i = p;
+    }
+    return 1;
+}
+
+static int bfq_pop(BFQueue *q, int *out_idx, BFNode *out) {
+    if (q->size == 0) return 0;
+    int top_idx = q->heap[0];
+    *out = q->nodes[top_idx];
+    if (out_idx) *out_idx = top_idx;
+    q->size--;
+    if (q->size > 0) {
+        q->heap[0] = q->heap[q->size];
+        size_t i = 0;
+        while (1) {
+            size_t l = i * 2 + 1;
+            size_t r = l + 1;
+            size_t s = i;
+            if (l < q->size) {
+                BFNode *nl = &q->nodes[q->heap[l]];
+                BFNode *ns = &q->nodes[q->heap[s]];
+                if (!bfq_cmp(ns, nl)) s = l;
+            }
+            if (r < q->size) {
+                BFNode *nr = &q->nodes[q->heap[r]];
+                BFNode *ns = &q->nodes[q->heap[s]];
+                if (!bfq_cmp(ns, nr)) s = r;
+            }
+            if (s == i) break;
+            int tmp = q->heap[i];
+            q->heap[i] = q->heap[s];
+            q->heap[s] = tmp;
+            i = s;
+        }
+    }
+    return 1;
+}
+
+static double now_seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
 
 static PyObject *
 try_steps_with_validator(const SearchCtx *ctx, const Op *ops, Py_ssize_t ops_len) {
@@ -587,6 +805,9 @@ try_steps_with_validator(const SearchCtx *ctx, const Op *ops, Py_ssize_t ops_len
                 return NULL;
             }
             if (ctx->validator) {
+                if (ctx->verbose) {
+                    ((SearchCtx *)ctx)->validations += 1;
+                }
                 PyObject *valid = PyObject_CallFunctionObjArgs(ctx->validator, chain, NULL);
                 if (!valid) {
                     Py_DECREF(chain);
@@ -597,6 +818,13 @@ try_steps_with_validator(const SearchCtx *ctx, const Op *ops, Py_ssize_t ops_len
                 int ok = PyObject_IsTrue(valid);
                 Py_DECREF(valid);
                 if (!ok) {
+                    if (ctx->verbose) {
+                        ((SearchCtx *)ctx)->validation_failures += 1;
+                        if (((SearchCtx *)ctx)->validation_failures <= ctx->log_fail_limit) {
+                            fprintf(stdout, "[dsc] validator reject op=REPLACE k=%zd\n", k);
+                            fflush(stdout);
+                        }
+                    }
                     Py_DECREF(chain);
                     Py_DECREF(steps);
                     PyMem_Free(current);
@@ -627,6 +855,9 @@ try_steps_with_validator(const SearchCtx *ctx, const Op *ops, Py_ssize_t ops_len
                 return NULL;
             }
             if (ctx->validator) {
+                if (ctx->verbose) {
+                    ((SearchCtx *)ctx)->validations += 1;
+                }
                 PyObject *valid = PyObject_CallFunctionObjArgs(ctx->validator, chain, NULL);
                 if (!valid) {
                     Py_DECREF(chain);
@@ -637,6 +868,13 @@ try_steps_with_validator(const SearchCtx *ctx, const Op *ops, Py_ssize_t ops_len
                 int ok = PyObject_IsTrue(valid);
                 Py_DECREF(valid);
                 if (!ok) {
+                    if (ctx->verbose) {
+                        ((SearchCtx *)ctx)->validation_failures += 1;
+                        if (((SearchCtx *)ctx)->validation_failures <= ctx->log_fail_limit) {
+                            fprintf(stdout, "[dsc] validator reject op=INSERT k=%zd\n", k);
+                            fflush(stdout);
+                        }
+                    }
                     Py_DECREF(chain);
                     Py_DECREF(steps);
                     PyMem_Free(current);
@@ -666,6 +904,9 @@ try_steps_with_validator(const SearchCtx *ctx, const Op *ops, Py_ssize_t ops_len
                 return NULL;
             }
             if (ctx->validator) {
+                if (ctx->verbose) {
+                    ((SearchCtx *)ctx)->validations += 1;
+                }
                 PyObject *valid = PyObject_CallFunctionObjArgs(ctx->validator, chain, NULL);
                 if (!valid) {
                     Py_DECREF(chain);
@@ -676,6 +917,13 @@ try_steps_with_validator(const SearchCtx *ctx, const Op *ops, Py_ssize_t ops_len
                 int ok = PyObject_IsTrue(valid);
                 Py_DECREF(valid);
                 if (!ok) {
+                    if (ctx->verbose) {
+                        ((SearchCtx *)ctx)->validation_failures += 1;
+                        if (((SearchCtx *)ctx)->validation_failures <= ctx->log_fail_limit) {
+                            fprintf(stdout, "[dsc] validator reject op=DELETE k=%zd\n", k);
+                            fflush(stdout);
+                        }
+                    }
                     Py_DECREF(chain);
                     Py_DECREF(steps);
                     PyMem_Free(current);
@@ -693,17 +941,308 @@ try_steps_with_validator(const SearchCtx *ctx, const Op *ops, Py_ssize_t ops_len
     }
 
     PyMem_Free(current);
+    if (ctx->verbose) {
+        ((SearchCtx *)ctx)->steps_checked += 1;
+        if (ctx->log_every > 0 && ctx->steps_checked % ctx->log_every == 0) {
+            fprintf(stdout, "[dsc] checked paths=%zd validations=%zd failures=%zd\n",
+                    ctx->steps_checked, ctx->validations, ctx->validation_failures);
+            fflush(stdout);
+        }
+    }
     return steps;
+}
+
+static PyObject *
+best_first_search(SearchCtx *ctx, const int *dp, const int *dp_rev, int max_extra) {
+    int min_dist = dp[ctx->m * (ctx->n + 1) + ctx->n];
+    int max_dist = min_dist + max_extra;
+
+    BFQueue q;
+    if (!bfq_init(&q, 1024)) {
+        PyErr_NoMemory();
+        return NULL;
+    }
+    q.beam_limit = (size_t)ctx->beam_size;
+
+    SeqBuf *start_seq = seqbuf_new(ctx->a, ctx->m);
+    if (!start_seq) {
+        bfq_free(&q);
+        PyErr_NoMemory();
+        return NULL;
+    }
+
+    BFNode start;
+    start.i = 0;
+    start.j = 0;
+    start.pos = 0;
+    start.g = 0;
+    start.f = dp_rev[ctx->m * (ctx->n + 1) + ctx->n];
+    start.parent = -1;
+    start.op = (Op){OP_MATCH, 0, 0};
+    start.seq = start_seq;
+    if (!bfq_push_node(&q, start)) {
+        seqbuf_dec(start_seq);
+        bfq_free(&q);
+        PyErr_NoMemory();
+        return NULL;
+    }
+
+    while (q.size > 0) {
+        BFNode cur;
+        int cur_idx = -1;
+        if (!bfq_pop(&q, &cur_idx, &cur)) break;
+
+        if (ctx->verbose) {
+            ctx->nodes_visited += 1;
+            if (ctx->log_every > 0 && ctx->nodes_visited % ctx->log_every == 0) {
+                fprintf(stdout, "[dsc] nodes=%zd i=%zd j=%zd g=%d f=%d queue=%zu\n",
+                        ctx->nodes_visited, cur.i, cur.j, cur.g, cur.f, q.size);
+                fflush(stdout);
+            }
+        }
+
+        if (ctx->max_nodes > 0 && ctx->nodes_visited >= ctx->max_nodes) {
+            break;
+        }
+
+        if (cur.f > max_dist) {
+            continue;
+        }
+
+        if (cur.i == ctx->m && cur.j == ctx->n) {
+            Py_ssize_t steps_len = 0;
+            for (int t = cur_idx; t >= 0; t = q.nodes[t].parent) {
+                steps_len++;
+                if (q.nodes[t].parent < 0) break;
+            }
+            PyObject *steps = PyList_New(0);
+            if (!steps) {
+                bfq_free(&q);
+                return NULL;
+            }
+            PyObject **tmp = (PyObject **)PyMem_Malloc(sizeof(PyObject *) * (size_t)steps_len);
+            if (!tmp) {
+                Py_DECREF(steps);
+                bfq_free(&q);
+                PyErr_NoMemory();
+                return NULL;
+            }
+            Py_ssize_t idx = steps_len;
+            for (int t = cur_idx; t >= 0; t = q.nodes[t].parent) {
+                BFNode *n = &q.nodes[t];
+                PyObject *s = ucs4_array_to_unicode(n->seq->data, n->seq->len);
+                if (!s) {
+                    PyMem_Free(tmp);
+                    Py_DECREF(steps);
+                    bfq_free(&q);
+                    return NULL;
+                }
+                tmp[--idx] = s;
+                if (n->parent < 0) break;
+            }
+            for (Py_ssize_t k = 0; k < steps_len; k++) {
+                PyList_Append(steps, tmp[k]);
+                Py_DECREF(tmp[k]);
+            }
+            PyMem_Free(tmp);
+            bfq_free(&q);
+            return steps;
+        }
+
+        if (cur.i < ctx->m && cur.j < ctx->n && ctx->a[cur.i] == ctx->b[cur.j]) {
+            BFNode next;
+            next.i = cur.i + 1;
+            next.j = cur.j + 1;
+            next.g = cur.g;
+            int h = dp_rev[(ctx->m - next.i) * (ctx->n + 1) + (ctx->n - next.j)];
+            next.f = next.g + h;
+            if (next.f <= max_dist) {
+                next.parent = cur_idx;
+                next.op = (Op){OP_MATCH, ctx->a[cur.i], 0};
+                seqbuf_inc(cur.seq);
+                next.seq = cur.seq;
+                next.pos = cur.pos + 1;
+                if (!bfq_push_node(&q, next)) {
+                    seqbuf_dec(next.seq);
+                    bfq_free(&q);
+                    PyErr_NoMemory();
+                    return NULL;
+                }
+            }
+        }
+
+        if (cur.i < ctx->m && cur.j < ctx->n) {
+            Py_ssize_t new_pos = cur.pos;
+            SeqBuf *sb = seqbuf_apply(cur.seq, OP_REPLACE, ctx->b[cur.j], cur.pos, &new_pos);
+            if (sb) {
+                if (ctx->validator) {
+                    PyObject *chain = ucs4_array_to_unicode(sb->data, sb->len);
+                    if (!chain) {
+                        seqbuf_dec(sb);
+                        bfq_free(&q);
+                        return NULL;
+                    }
+                    PyObject *valid = PyObject_CallFunctionObjArgs(ctx->validator, chain, NULL);
+                    Py_DECREF(chain);
+                    if (!valid) {
+                        seqbuf_dec(sb);
+                        bfq_free(&q);
+                        return NULL;
+                    }
+                    int ok = PyObject_IsTrue(valid);
+                    Py_DECREF(valid);
+                    if (!ok) {
+                        seqbuf_dec(sb);
+                        goto skip_replace;
+                    }
+                }
+                BFNode next;
+                next.i = cur.i + 1;
+                next.j = cur.j + 1;
+                next.g = cur.g + 1;
+                int h = dp_rev[(ctx->m - next.i) * (ctx->n + 1) + (ctx->n - next.j)];
+                next.f = next.g + h;
+                if (next.f <= max_dist) {
+                    next.parent = cur_idx;
+                    next.op = (Op){OP_REPLACE, ctx->a[cur.i], ctx->b[cur.j]};
+                    next.seq = sb;
+                    next.pos = new_pos;
+                    if (!bfq_push_node(&q, next)) {
+                        seqbuf_dec(sb);
+                        bfq_free(&q);
+                        PyErr_NoMemory();
+                        return NULL;
+                    }
+                } else {
+                    seqbuf_dec(sb);
+                }
+            }
+        }
+        skip_replace:
+
+        if (cur.j < ctx->n) {
+            Py_ssize_t new_pos = cur.pos;
+            SeqBuf *sb = seqbuf_apply(cur.seq, OP_INSERT, ctx->b[cur.j], cur.pos, &new_pos);
+            if (sb) {
+                if (ctx->validator) {
+                    PyObject *chain = ucs4_array_to_unicode(sb->data, sb->len);
+                    if (!chain) {
+                        seqbuf_dec(sb);
+                        bfq_free(&q);
+                        return NULL;
+                    }
+                    PyObject *valid = PyObject_CallFunctionObjArgs(ctx->validator, chain, NULL);
+                    Py_DECREF(chain);
+                    if (!valid) {
+                        seqbuf_dec(sb);
+                        bfq_free(&q);
+                        return NULL;
+                    }
+                    int ok = PyObject_IsTrue(valid);
+                    Py_DECREF(valid);
+                    if (!ok) {
+                        seqbuf_dec(sb);
+                        goto skip_insert;
+                    }
+                }
+                BFNode next;
+                next.i = cur.i;
+                next.j = cur.j + 1;
+                next.g = cur.g + 1;
+                int h = dp_rev[(ctx->m - next.i) * (ctx->n + 1) + (ctx->n - next.j)];
+                next.f = next.g + h;
+                if (next.f <= max_dist) {
+                    next.parent = cur_idx;
+                    next.op = (Op){OP_INSERT, 0, ctx->b[cur.j]};
+                    next.seq = sb;
+                    next.pos = new_pos;
+                    if (!bfq_push_node(&q, next)) {
+                        seqbuf_dec(sb);
+                        bfq_free(&q);
+                        PyErr_NoMemory();
+                        return NULL;
+                    }
+                } else {
+                    seqbuf_dec(sb);
+                }
+            }
+        }
+        skip_insert:
+
+        if (cur.i < ctx->m) {
+            Py_ssize_t new_pos = cur.pos;
+            SeqBuf *sb = seqbuf_apply(cur.seq, OP_DELETE, 0, cur.pos, &new_pos);
+            if (sb) {
+                if (ctx->validator) {
+                    PyObject *chain = ucs4_array_to_unicode(sb->data, sb->len);
+                    if (!chain) {
+                        seqbuf_dec(sb);
+                        bfq_free(&q);
+                        return NULL;
+                    }
+                    PyObject *valid = PyObject_CallFunctionObjArgs(ctx->validator, chain, NULL);
+                    Py_DECREF(chain);
+                    if (!valid) {
+                        seqbuf_dec(sb);
+                        bfq_free(&q);
+                        return NULL;
+                    }
+                    int ok = PyObject_IsTrue(valid);
+                    Py_DECREF(valid);
+                    if (!ok) {
+                        seqbuf_dec(sb);
+                        goto skip_delete;
+                    }
+                }
+                BFNode next;
+                next.i = cur.i + 1;
+                next.j = cur.j;
+                next.g = cur.g + 1;
+                int h = dp_rev[(ctx->m - next.i) * (ctx->n + 1) + (ctx->n - next.j)];
+                next.f = next.g + h;
+                if (next.f <= max_dist) {
+                    next.parent = cur_idx;
+                    next.op = (Op){OP_DELETE, ctx->a[cur.i], 0};
+                    next.seq = sb;
+                    next.pos = new_pos;
+                    if (!bfq_push_node(&q, next)) {
+                        seqbuf_dec(sb);
+                        bfq_free(&q);
+                        PyErr_NoMemory();
+                        return NULL;
+                    }
+                } else {
+                    seqbuf_dec(sb);
+                }
+            }
+        }
+        skip_delete:
+        ;
+    }
+
+    bfq_free(&q);
+    return NULL;
 }
 
 static int
 search_paths(SearchCtx *ctx, Py_ssize_t i, Py_ssize_t j, Py_ssize_t depth) {
-    if (i == ctx->m && j == ctx->n) {
+    if (ctx->verbose) {
+        ctx->nodes_visited += 1;
+        if (ctx->log_every > 0 && ctx->nodes_visited % ctx->log_every == 0) {
+            fprintf(stdout, "[dsc] nodes=%zd depth=%zd i=%zd j=%zd\n",
+                    ctx->nodes_visited, depth, i, j);
+            fflush(stdout);
+        }
+    }
+    if (i == 0 && j == 0) {
         Py_ssize_t ops_len = depth;
         Op *forward = (Op *)PyMem_Malloc(sizeof(Op) * (size_t)ops_len);
-        if (!forward) return -1;
+        if (!forward) {
+            PyErr_NoMemory();
+            return -1;
+        }
         for (Py_ssize_t k = 0; k < ops_len; k++) {
-            forward[k] = ctx->stack[k];
+            forward[k] = ctx->stack[ops_len - 1 - k];
         }
         PyObject *steps = try_steps_with_validator(ctx, forward, ops_len);
         PyMem_Free(forward);
@@ -711,36 +1250,40 @@ search_paths(SearchCtx *ctx, Py_ssize_t i, Py_ssize_t j, Py_ssize_t depth) {
             ctx->steps_found = steps;
             return 1;
         }
+        if (PyErr_Occurred()) {
+            return -1;
+        }
         return 0;
     }
 
-    if (depth >= ctx->max_ops) return 0;
-
-    int current_val = ctx->dp[i * (ctx->n + 1) + j];
-
-    if (i < ctx->m && j < ctx->n && ctx->a[i] == ctx->b[j] && 
-        ctx->dp[(i + 1) * (ctx->n + 1) + (j + 1)] == current_val) {
-        ctx->stack[depth] = (Op){OP_MATCH, ctx->a[i], 0};
-        if (search_paths(ctx, i + 1, j + 1, depth + 1)) return 1;
+    if (depth >= ctx->max_ops) {
+        return 0;
     }
 
-    if (i < ctx->m && ctx->dp[(i + 1) * (ctx->n + 1) + j] == current_val + 1) {
-        ctx->stack[depth] = (Op){OP_DELETE, ctx->a[i], 0};
-        if (search_paths(ctx, i + 1, j, depth + 1)) return 1;
+    int rc;
+    if (i > 0 && j > 0 && ctx->a[i - 1] == ctx->b[j - 1]) {
+        ctx->stack[depth] = (Op){OP_MATCH, ctx->a[i - 1], 0};
+        rc = search_paths(ctx, i - 1, j - 1, depth + 1);
+        if (rc != 0) return rc;
     }
-
-    if (j < ctx->n && ctx->dp[i * (ctx->n + 1) + (j + 1)] == current_val + 1) {
-        ctx->stack[depth] = (Op){OP_INSERT, 0, ctx->b[j]};
-        if (search_paths(ctx, i, j + 1, depth + 1)) return 1;
+    if (i > 0 && j > 0) {
+        ctx->stack[depth] = (Op){OP_REPLACE, ctx->a[i - 1], ctx->b[j - 1]};
+        rc = search_paths(ctx, i - 1, j - 1, depth + 1);
+        if (rc != 0) return rc;
     }
-
-    if (i < ctx->m && j < ctx->n && ctx->dp[(i + 1) * (ctx->n + 1) + (j + 1)] == current_val + 1) {
-        ctx->stack[depth] = (Op){OP_REPLACE, ctx->a[i], ctx->b[j]};
-        if (search_paths(ctx, i + 1, j + 1, depth + 1)) return 1;
+    if (j > 0) {
+        ctx->stack[depth] = (Op){OP_INSERT, 0, ctx->b[j - 1]};
+        rc = search_paths(ctx, i, j - 1, depth + 1);
+        if (rc != 0) return rc;
     }
-
+    if (i > 0) {
+        ctx->stack[depth] = (Op){OP_DELETE, ctx->a[i - 1], 0};
+        rc = search_paths(ctx, i - 1, j, depth + 1);
+        if (rc != 0) return rc;
+    }
     return 0;
 }
+
 static PyObject *
 algo_seq_dynamic_with_validation_run(PyObject *self, PyObject *args, PyObject *kwargs) {
     PyObject *a_obj;
@@ -777,6 +1320,30 @@ algo_seq_dynamic_with_validation_run(PyObject *self, PyObject *args, PyObject *k
     }
     int min_dist = dp[m * (n + 1) + n];
 
+    Py_UCS4 *a_rev = (Py_UCS4 *)PyMem_Malloc(sizeof(Py_UCS4) * (size_t)m);
+    Py_UCS4 *b_rev = (Py_UCS4 *)PyMem_Malloc(sizeof(Py_UCS4) * (size_t)n);
+    if (!a_rev || !b_rev) {
+        PyMem_Free(a_rev);
+        PyMem_Free(b_rev);
+        PyMem_Free(a);
+        PyMem_Free(b);
+        PyMem_Free(dp);
+        PyErr_NoMemory();
+        return NULL;
+    }
+    for (Py_ssize_t i = 0; i < m; i++) a_rev[i] = a[m - 1 - i];
+    for (Py_ssize_t j = 0; j < n; j++) b_rev[j] = b[n - 1 - j];
+
+    int *dp_rev = NULL;
+    if (compute_dp(a_rev, m, b_rev, n, &dp_rev) < 0) {
+        PyMem_Free(a_rev);
+        PyMem_Free(b_rev);
+        PyMem_Free(a);
+        PyMem_Free(b);
+        PyMem_Free(dp);
+        return NULL;
+    }
+
     PyObject *steps_found = NULL;
     PyObject *validator_to_use = validator ? validator : NULL;
     if (validator_to_use) {
@@ -792,40 +1359,74 @@ algo_seq_dynamic_with_validation_run(PyObject *self, PyObject *args, PyObject *k
     ctx.steps_found = NULL;
     ctx.stack = NULL;
     ctx.max_ops = 0;
-    ctx.dp = dp;
+    ctx.verbose = 0;
+    ctx.nodes_visited = 0;
+    ctx.validations = 0;
+    ctx.validation_failures = 0;
+    ctx.steps_checked = 0;
+    ctx.log_every = 10000;
+    ctx.log_fail_limit = 5;
+    ctx.max_nodes = 2000000;
+    ctx.beam_size = 50000;
 
-    for (int extra = 0; extra < 5; extra++) {
-        ctx.max_ops = (Py_ssize_t)min_dist + extra;
-        if (ctx.max_ops < 0) ctx.max_ops = 0;
-        ctx.stack = (Op *)PyMem_Malloc(sizeof(Op) * (size_t)(ctx.max_ops + 1));
-        if (!ctx.stack) {
-            Py_XDECREF(validator_to_use);
-            PyMem_Free(a);
-            PyMem_Free(b);
-            PyMem_Free(dp);
-            PyErr_NoMemory();
-            return NULL;
-        }
-        int rc = search_paths(&ctx, 0, 0, 0); 
-        PyMem_Free(ctx.stack);
-        ctx.stack = NULL;
-        if (rc < 0) {
-            Py_XDECREF(validator_to_use);
-            PyMem_Free(a);
-            PyMem_Free(b);
-            PyMem_Free(dp);
-            return NULL;
-        }
-        if (rc > 0) {
-            steps_found = ctx.steps_found;
-            break;
-        }
+    const char *verbose_env = getenv("DSC_VERBOSE");
+    if (verbose_env && verbose_env[0] != '\0' && verbose_env[0] != '0') {
+        ctx.verbose = 1;
+    }
+    const char *log_every_env = getenv("DSC_LOG_EVERY");
+    if (log_every_env && log_every_env[0] != '\0') {
+        long v = strtol(log_every_env, NULL, 10);
+        if (v > 0) ctx.log_every = (Py_ssize_t)v;
+    }
+    const char *log_fail_env = getenv("DSC_LOG_FAILS");
+    if (log_fail_env && log_fail_env[0] != '\0') {
+        long v = strtol(log_fail_env, NULL, 10);
+        if (v >= 0) ctx.log_fail_limit = (Py_ssize_t)v;
+    }
+    const char *max_nodes_env = getenv("DSC_MAX_NODES");
+    if (max_nodes_env && max_nodes_env[0] != '\0') {
+        long v = strtol(max_nodes_env, NULL, 10);
+        if (v > 0) ctx.max_nodes = (Py_ssize_t)v;
+    }
+    const char *beam_env = getenv("DSC_BEAM_SIZE");
+    if (beam_env && beam_env[0] != '\0') {
+        long v = strtol(beam_env, NULL, 10);
+        if (v > 0) ctx.beam_size = (Py_ssize_t)v;
+    }
+    double t0 = 0.0;
+    if (ctx.verbose) {
+        t0 = now_seconds();
+        fprintf(stdout, "[dsc] start m=%zd n=%zd min_dist=%d\n", m, n, min_dist);
+        fflush(stdout);
+    }
+
+    steps_found = best_first_search(&ctx, dp, dp_rev, 4);
+    if (!steps_found && PyErr_Occurred()) {
+        Py_XDECREF(validator_to_use);
+        PyMem_Free(a);
+        PyMem_Free(b);
+        PyMem_Free(dp);
+        PyMem_Free(a_rev);
+        PyMem_Free(b_rev);
+        PyMem_Free(dp_rev);
+        return NULL;
+    }
+
+    if (ctx.verbose) {
+        double t1 = now_seconds();
+        fprintf(stdout,
+                "[dsc] done nodes=%zd paths_checked=%zd validations=%zd failures=%zd elapsed=%.3fs\n",
+                ctx.nodes_visited, ctx.steps_checked, ctx.validations, ctx.validation_failures, t1 - t0);
+        fflush(stdout);
     }
 
     Py_XDECREF(validator_to_use);
     PyMem_Free(a);
     PyMem_Free(b);
     PyMem_Free(dp);
+    PyMem_Free(a_rev);
+    PyMem_Free(b_rev);
+    PyMem_Free(dp_rev);
 
     if (!steps_found) {
         PyObject *none = PyTuple_Pack(3, Py_None, Py_None, Py_None);
@@ -859,13 +1460,13 @@ static PyMethodDef module_methods[] = {
 
 static struct PyModuleDef moduledef = {
     PyModuleDef_HEAD_INIT,
-    "datasetgradualstep_c",
+    "_core",
     "C implementation of datasetgradualstep algorithms.",
     -1,
     module_methods
 };
 
 PyMODINIT_FUNC
-PyInit_datasetgradualstep_c(void) {
+PyInit__core(void) {
     return PyModule_Create(&moduledef);
 }
