@@ -1,1 +1,4 @@
 dompdb/
+*.so
+venv/
+__pycache__/

@@ -3,11 +3,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+
 typedef enum {
     OP_MATCH = 0,
     OP_REPLACE = 1,
     OP_INSERT = 2,
-    OP_DELETE = 3
+    OP_DELETE = 3,
 } OpType;
 
 typedef struct {
@@ -99,6 +100,7 @@ op_to_tuple(const Op *op) {
             Py_DECREF(ch);
             break;
         }
+        
         default:
             PyErr_SetString(PyExc_RuntimeError, "Unknown op type");
             return NULL;
@@ -534,6 +536,7 @@ typedef struct {
     PyObject *steps_found;
     Op *stack;
     Py_ssize_t max_ops;
+    int *dp; 
 } SearchCtx;
 
 static PyObject *
@@ -695,15 +698,12 @@ try_steps_with_validator(const SearchCtx *ctx, const Op *ops, Py_ssize_t ops_len
 
 static int
 search_paths(SearchCtx *ctx, Py_ssize_t i, Py_ssize_t j, Py_ssize_t depth) {
-    if (i == 0 && j == 0) {
+    if (i == ctx->m && j == ctx->n) {
         Py_ssize_t ops_len = depth;
         Op *forward = (Op *)PyMem_Malloc(sizeof(Op) * (size_t)ops_len);
-        if (!forward) {
-            PyErr_NoMemory();
-            return -1;
-        }
+        if (!forward) return -1;
         for (Py_ssize_t k = 0; k < ops_len; k++) {
-            forward[k] = ctx->stack[ops_len - 1 - k];
+            forward[k] = ctx->stack[k];
         }
         PyObject *steps = try_steps_with_validator(ctx, forward, ops_len);
         PyMem_Free(forward);
@@ -711,40 +711,36 @@ search_paths(SearchCtx *ctx, Py_ssize_t i, Py_ssize_t j, Py_ssize_t depth) {
             ctx->steps_found = steps;
             return 1;
         }
-        if (PyErr_Occurred()) {
-            return -1;
-        }
         return 0;
     }
 
-    if (depth >= ctx->max_ops) {
-        return 0;
+    if (depth >= ctx->max_ops) return 0;
+
+    int current_val = ctx->dp[i * (ctx->n + 1) + j];
+
+    if (i < ctx->m && j < ctx->n && ctx->a[i] == ctx->b[j] && 
+        ctx->dp[(i + 1) * (ctx->n + 1) + (j + 1)] == current_val) {
+        ctx->stack[depth] = (Op){OP_MATCH, ctx->a[i], 0};
+        if (search_paths(ctx, i + 1, j + 1, depth + 1)) return 1;
     }
 
-    int rc;
-    if (i > 0 && j > 0 && ctx->a[i - 1] == ctx->b[j - 1]) {
-        ctx->stack[depth] = (Op){OP_MATCH, ctx->a[i - 1], 0};
-        rc = search_paths(ctx, i - 1, j - 1, depth + 1);
-        if (rc != 0) return rc;
+    if (i < ctx->m && ctx->dp[(i + 1) * (ctx->n + 1) + j] == current_val + 1) {
+        ctx->stack[depth] = (Op){OP_DELETE, ctx->a[i], 0};
+        if (search_paths(ctx, i + 1, j, depth + 1)) return 1;
     }
-    if (i > 0 && j > 0) {
-        ctx->stack[depth] = (Op){OP_REPLACE, ctx->a[i - 1], ctx->b[j - 1]};
-        rc = search_paths(ctx, i - 1, j - 1, depth + 1);
-        if (rc != 0) return rc;
+
+    if (j < ctx->n && ctx->dp[i * (ctx->n + 1) + (j + 1)] == current_val + 1) {
+        ctx->stack[depth] = (Op){OP_INSERT, 0, ctx->b[j]};
+        if (search_paths(ctx, i, j + 1, depth + 1)) return 1;
     }
-    if (j > 0) {
-        ctx->stack[depth] = (Op){OP_INSERT, 0, ctx->b[j - 1]};
-        rc = search_paths(ctx, i, j - 1, depth + 1);
-        if (rc != 0) return rc;
+
+    if (i < ctx->m && j < ctx->n && ctx->dp[(i + 1) * (ctx->n + 1) + (j + 1)] == current_val + 1) {
+        ctx->stack[depth] = (Op){OP_REPLACE, ctx->a[i], ctx->b[j]};
+        if (search_paths(ctx, i + 1, j + 1, depth + 1)) return 1;
     }
-    if (i > 0) {
-        ctx->stack[depth] = (Op){OP_DELETE, ctx->a[i - 1], 0};
-        rc = search_paths(ctx, i - 1, j, depth + 1);
-        if (rc != 0) return rc;
-    }
+
     return 0;
 }
-
 static PyObject *
 algo_seq_dynamic_with_validation_run(PyObject *self, PyObject *args, PyObject *kwargs) {
     PyObject *a_obj;
@@ -796,6 +792,7 @@ algo_seq_dynamic_with_validation_run(PyObject *self, PyObject *args, PyObject *k
     ctx.steps_found = NULL;
     ctx.stack = NULL;
     ctx.max_ops = 0;
+    ctx.dp = dp;
 
     for (int extra = 0; extra < 5; extra++) {
         ctx.max_ops = (Py_ssize_t)min_dist + extra;
@@ -809,7 +806,7 @@ algo_seq_dynamic_with_validation_run(PyObject *self, PyObject *args, PyObject *k
             PyErr_NoMemory();
             return NULL;
         }
-        int rc = search_paths(&ctx, m, n, 0);
+        int rc = search_paths(&ctx, 0, 0, 0); 
         PyMem_Free(ctx.stack);
         ctx.stack = NULL;
         if (rc < 0) {
