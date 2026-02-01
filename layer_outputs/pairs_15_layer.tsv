@@ -1,0 +1,15 @@
+12asA00|chain:A	16pkA02|chain:A	0	4	327	208	250	kmer_topm+lev
+152lA00|chain:A	17gsA01|chain:A	1	6	164	99	129	kmer_topm+lev
+153lA00|chain:A	155cA00|chain:A	2	3	185	134	141	kmer_topm+lev
+155cA00|chain:A	17gsA01|chain:A	3	6	134	99	106	kmer_topm+lev
+16pkA02|chain:A	16vpA00|chain:A	4	5	208	311	243	kmer_topm+lev
+16pkA02|chain:A	19hcA02|chain:A	4	9	208	137	158	kmer_topm+lev
+17gsA01|chain:A	1a02F00|chain:F	6	10	99	53	78	kmer_topm+lev
+17gsA01|chain:A	1a0rP01|chain:P	6	14	99	129	102	kmer_topm+lev
+1914A00|chain:A	1a0rP01|chain:P	7	14	171	129	131	kmer_topm+lev
+19hcA01|chain:A	1a04A01|chain:A	8	11	155	124	123	kmer_topm+lev
+19hcA02|chain:A	1a04A01|chain:A	9	11	137	124	108	kmer_topm+lev
+19hcA02|chain:A	1a2zA00|chain:A	9	15	137	220	168	kmer_topm+lev
+1a02F00|chain:F	1a0hA01|chain:A	10	13	53	89	70	kmer_topm+lev
+1a04A01|chain:A	1a0hA01|chain:A	11	13	124	89	96	kmer_topm+lev
+1a0cA00|chain:A	1a2zA00|chain:A	12	15	437	220	337	kmer_topm+lev
