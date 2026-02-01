@@ -4,6 +4,7 @@
 #include <string.h>
 #include <time.h>
 #include <stdio.h>
+#include <errno.h>
 
 typedef enum {
     OP_MATCH = 0,
@@ -252,7 +253,56 @@ build_operations_from_steps(PyObject *steps) {
         Py_ssize_t prev_len = PyUnicode_GetLength(prev);
         Py_ssize_t curr_len = PyUnicode_GetLength(curr);
         PyObject *tuple = NULL;
-        if (curr_len > prev_len) {
+        if (curr_len == prev_len) {
+            int is_reverse = 1;
+            for (Py_ssize_t j = 0; j < curr_len; j++) {
+                if (PyUnicode_ReadChar(curr, j) != PyUnicode_ReadChar(prev, curr_len - 1 - j)) {
+                    is_reverse = 0;
+                    break;
+                }
+            }
+            if (is_reverse) {
+                PyObject *name = PyUnicode_FromString("reverse");
+                if (!name) {
+                    Py_DECREF(ops);
+                    return NULL;
+                }
+                tuple = PyTuple_Pack(1, name);
+                Py_DECREF(name);
+            } else {
+                Py_ssize_t diff1 = -1;
+                Py_ssize_t diff2 = -1;
+                int diff_count = 0;
+                for (Py_ssize_t j = 0; j < curr_len; j++) {
+                    if (PyUnicode_ReadChar(curr, j) != PyUnicode_ReadChar(prev, j)) {
+                        diff_count += 1;
+                        if (diff1 < 0) diff1 = j;
+                        else if (diff2 < 0) diff2 = j;
+                    }
+                }
+                if (diff_count == 2 && diff1 >= 0 && diff2 >= 0) {
+                    Py_UCS4 a1 = PyUnicode_ReadChar(prev, diff1);
+                    Py_UCS4 a2 = PyUnicode_ReadChar(prev, diff2);
+                    if (PyUnicode_ReadChar(curr, diff1) == a2 && PyUnicode_ReadChar(curr, diff2) == a1) {
+                        PyObject *name = PyUnicode_FromString("swap");
+                        PyObject *iobj = PyLong_FromSsize_t(diff1);
+                        PyObject *jobj = PyLong_FromSsize_t(diff2);
+                        if (!name || !iobj || !jobj) {
+                            Py_XDECREF(name);
+                            Py_XDECREF(iobj);
+                            Py_XDECREF(jobj);
+                            Py_DECREF(ops);
+                            return NULL;
+                        }
+                        tuple = PyTuple_Pack(3, name, iobj, jobj);
+                        Py_DECREF(name);
+                        Py_DECREF(iobj);
+                        Py_DECREF(jobj);
+                    }
+                }
+            }
+        }
+        if (!tuple && curr_len > prev_len) {
             Py_ssize_t j;
             for (j = 0; j < curr_len; j++) {
                 if (j >= prev_len || PyUnicode_ReadChar(curr, j) != PyUnicode_ReadChar(prev, j)) {
@@ -271,7 +321,7 @@ build_operations_from_steps(PyObject *steps) {
                     break;
                 }
             }
-        } else if (curr_len < prev_len) {
+        } else if (!tuple && curr_len < prev_len) {
             Py_ssize_t j;
             for (j = 0; j < prev_len; j++) {
                 if (j >= curr_len || PyUnicode_ReadChar(curr, j) != PyUnicode_ReadChar(prev, j)) {
@@ -290,7 +340,7 @@ build_operations_from_steps(PyObject *steps) {
                     break;
                 }
             }
-        } else {
+        } else if (!tuple) {
             int diff_found = 0;
             for (Py_ssize_t j = 0; j < curr_len; j++) {
                 Py_UCS4 c1 = PyUnicode_ReadChar(curr, j);
@@ -546,6 +596,8 @@ typedef struct {
     Py_ssize_t max_nodes;
     Py_ssize_t beam_size;
     int max_unvalidated_steps;
+    double time_limit_s;
+    double start_time_s;
 } SearchCtx;
 
 typedef struct SeqBuf {
@@ -756,6 +808,11 @@ static double now_seconds(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+static int time_exceeded(const SearchCtx *ctx) {
+    if (ctx->time_limit_s <= 0.0) return 0;
+    return (now_seconds() - ctx->start_time_s) >= ctx->time_limit_s;
 }
 
 static PyObject *
@@ -993,19 +1050,6 @@ validate_ops_prefix(SearchCtx *ctx, const Op *ops, Py_ssize_t ops_len,
             i += 1;
             j += 1;
             pos += 1;
-            PyObject *chain = ucs4_array_to_unicode(cur->data, cur->len);
-            if (!chain) {
-                Py_DECREF(steps);
-                seqbuf_dec(cur);
-                return -1;
-            }
-            if (PyList_Append(steps, chain) < 0) {
-                Py_DECREF(chain);
-                Py_DECREF(steps);
-                seqbuf_dec(cur);
-                return -1;
-            }
-            Py_DECREF(chain);
             continue;
         }
 
@@ -1199,6 +1243,10 @@ best_first_search_from(SearchCtx *ctx, const int *dp, const int *dp_rev, int max
     }
 
     while (q.size > 0) {
+        if (time_exceeded(ctx)) {
+            bfq_free(&q);
+            return NULL;
+        }
         BFNode cur;
         int cur_idx = -1;
         if (!bfq_pop(&q, &cur_idx, &cur)) break;
@@ -1594,6 +1642,8 @@ algo_seq_dynamic_with_validation_run(PyObject *self, PyObject *args, PyObject *k
     ctx.max_nodes = 2000000;
     ctx.beam_size = 50000;
     ctx.max_unvalidated_steps = 0;
+    ctx.time_limit_s = 0.0;
+    ctx.start_time_s = 0.0;
 
     const char *verbose_env = getenv("DSC_VERBOSE");
     if (verbose_env && verbose_env[0] != '\0' && verbose_env[0] != '0') {
@@ -1624,12 +1674,19 @@ algo_seq_dynamic_with_validation_run(PyObject *self, PyObject *args, PyObject *k
         long v = strtol(unval_env, NULL, 10);
         if (v >= 0) ctx.max_unvalidated_steps = (int)v;
     }
+    const char *time_env = getenv("DSC_MAX_SECONDS");
+    if (time_env && time_env[0] != '\0') {
+        char *endp = NULL;
+        double v = strtod(time_env, &endp);
+        if (endp != time_env && v > 0.0) ctx.time_limit_s = v;
+    }
     double t0 = 0.0;
     if (ctx.verbose) {
         t0 = now_seconds();
         fprintf(stdout, "[dsc] start m=%zd n=%zd min_dist=%d\n", m, n, min_dist);
         fflush(stdout);
     }
+    ctx.start_time_s = now_seconds();
 
     Py_ssize_t ops_len = 0;
     PyObject *ops_capsule = reverse_ops_from_dp(a, m, b, n, dp, &ops_len);
@@ -1729,7 +1786,22 @@ algo_seq_dynamic_with_validation_run(PyObject *self, PyObject *args, PyObject *k
         return NULL;
     }
     Py_ssize_t ops_len2 = PyList_Size(ops_list);
-    PyObject *dist_obj = PyLong_FromSsize_t(ops_len2);
+    Py_ssize_t dist_weight = 0;
+    for (Py_ssize_t i = 0; i < ops_len2; i++) {
+        PyObject *op = PyList_GetItem(ops_list, i);
+        if (!PyTuple_Check(op) || PyTuple_Size(op) < 1) {
+            dist_weight += 1;
+            continue;
+        }
+        PyObject *name = PyTuple_GetItem(op, 0);
+        if (name && PyUnicode_Check(name)) {
+            if (PyUnicode_CompareWithASCIIString(name, "reverse") == 0) {
+                continue;
+            }
+        }
+        dist_weight += 1;
+    }
+    PyObject *dist_obj = PyLong_FromSsize_t(dist_weight);
     if (!dist_obj) {
         Py_DECREF(steps_found);
         Py_DECREF(ops_list);
