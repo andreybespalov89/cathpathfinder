@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cath_nn_lev"
+version = "0.1.0"
+description = "Nearest neighbor search in polyfasta with k-mer prefilter and Levenshtein distance"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+[tool.setuptools]
+packages = ["cath_nn_lev"]
+
+[tool.setuptools.package-data]
+"cath_nn_lev" = []
