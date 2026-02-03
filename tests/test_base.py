@@ -1,6 +1,6 @@
 
 import pytest
-import datasetgradualstep_c.datasetgradualstep_c as dsc
+import datasetgradualstep_c as dsc
 
 def test_algo_replace(): #Тест на замену одной буквы на другую
     def custom_validator(chain):
@@ -54,12 +54,20 @@ def test_algo_center_insert(): #Добавление в центр
     print(steps)
     assert (steps == ['ADE', 'ABDE', 'ABCDE']) and (operations[-1][0] == 'insert')
 
-def test_algo_swap(): #Тест на свап
+
+def test_algo_swap_1(): #Тест на свап 
     def custom_validator(chain): 
         return True
-    a_seq = "ABCDEF"
-    b_seq = "ABDCEF"
+    a_seq = "AB"
+    b_seq = "BA"
     steps, operations, distance =  dsc.algo_seq_dynamic_with_validation_run(a_seq, b_seq, validator=custom_validator)
     print(steps)
-    assert (steps == ['ABCDEF', 'ABDCEF']) and (operations[-1][0] == 'replace')
+    print(f'Последнее слово:{steps[-1]}')
+    assert (steps == ['AB', 'BA']) and (operations[-1][0] == 'swap')
+
+def test_single_char(): #Единичная буква
+    steps, ops, dist = dsc.algo_seq_dynamic_run("a", "a")
+    assert dist == 0
+    assert ops == [("match", "a")]
+
 

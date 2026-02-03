@@ -10,14 +10,18 @@ typedef enum {
     OP_MATCH = 0,
     OP_REPLACE = 1,
     OP_INSERT = 2,
-    OP_DELETE = 3
+    OP_DELETE = 3, 
+    OP_SWAP = 4
 } OpType;
 
 typedef struct {
     OpType type;
     Py_UCS4 a;
     Py_UCS4 b;
+    Py_ssize_t i;
 } Op;
+
+static Op *build_operations_from_steps_internal(PyObject *steps, Py_ssize_t *out_len);
 
 static int
 unicode_to_ucs4_array(PyObject *u, Py_UCS4 **out, Py_ssize_t *out_len) {
@@ -102,6 +106,21 @@ op_to_tuple(const Op *op) {
             Py_DECREF(ch);
             break;
         }
+
+        case OP_SWAP: {
+            PyObject *name = PyUnicode_FromString("swap");
+            PyObject *iobj = PyLong_FromSsize_t(op->i);
+            if (!name || !iobj) {
+                Py_XDECREF(name);
+                Py_XDECREF(iobj);
+                return NULL;
+            }
+            t = PyTuple_Pack(2, name, iobj);
+            Py_DECREF(name);
+            Py_DECREF(iobj);
+            break;
+        }
+
         default:
             PyErr_SetString(PyExc_RuntimeError, "Unknown op type");
             return NULL;
@@ -183,15 +202,19 @@ build_steps_from_ops(const Py_UCS4 *a, Py_ssize_t a_len, const Op *ops, Py_ssize
             Py_DECREF(s);
             i += 1;
         } else if (op.type == OP_INSERT) {
-            if (i < 0 || i > cur_len) {
+            // FIXED: Use current cursor i instead of static op.i
+            Py_ssize_t insert_pos = i;
+            if (insert_pos < 0 || insert_pos > cur_len) {
                 PyErr_SetString(PyExc_RuntimeError, "Insert index out of range");
                 Py_DECREF(steps);
                 PyMem_Free(current);
                 return NULL;
             }
-            memmove(current + i + 1, current + i, sizeof(Py_UCS4) * (size_t)(cur_len - i));
-            current[i] = op.b;
+            memmove(current + insert_pos + 1, current + insert_pos, 
+                    sizeof(Py_UCS4) * (size_t)(cur_len - insert_pos));
+            current[insert_pos] = op.b;
             cur_len += 1;
+            
             PyObject *s = ucs4_array_to_unicode(current, cur_len);
             if (!s) {
                 Py_DECREF(steps);
@@ -205,8 +228,10 @@ build_steps_from_ops(const Py_UCS4 *a, Py_ssize_t a_len, const Op *ops, Py_ssize
                 return NULL;
             }
             Py_DECREF(s);
-            i += 1;
-        } else if (op.type == OP_DELETE) {
+            
+            i += 1; // Advance cursor past inserted char
+        }
+        else if (op.type == OP_DELETE) {
             if (i < 0 || i >= cur_len) {
                 PyErr_SetString(PyExc_RuntimeError, "Delete index out of range");
                 Py_DECREF(steps);
@@ -228,6 +253,32 @@ build_steps_from_ops(const Py_UCS4 *a, Py_ssize_t a_len, const Op *ops, Py_ssize
                 return NULL;
             }
             Py_DECREF(s);
+            // i stays at the same index because the next char moved here
+        }  else if (op.type == OP_SWAP) {
+            // FIXED: Use current cursor i instead of static op.i
+            if (i < 0 || i + 1 >= cur_len) {
+                PyErr_SetString(PyExc_RuntimeError, "Swap index out of range");
+                Py_DECREF(steps);
+                PyMem_Free(current);
+                return NULL;
+            }
+            Py_UCS4 tmp = current[i];
+            current[i] = current[i + 1];
+            current[i + 1] = tmp;
+            PyObject *s = ucs4_array_to_unicode(current, cur_len);
+            if (!s) {
+                Py_DECREF(steps);
+                PyMem_Free(current);
+                return NULL;
+            }
+            if (PyList_Append(steps, s) < 0) {
+                Py_DECREF(s);
+                Py_DECREF(steps);
+                PyMem_Free(current);
+                return NULL;
+            }
+            Py_DECREF(s);
+            i += 2; // Advance past both swapped chars
         }
     }
 
@@ -237,167 +288,30 @@ build_steps_from_ops(const Py_UCS4 *a, Py_ssize_t a_len, const Op *ops, Py_ssize
 
 static PyObject *
 build_operations_from_steps(PyObject *steps) {
-    Py_ssize_t count = PyList_Size(steps);
-    PyObject *ops = PyList_New(0);
-    if (!ops) {
+    Py_ssize_t op_count;
+    Op *ops = build_operations_from_steps_internal(steps, &op_count);
+    if (!ops && op_count > 0) {
+        return NULL;  // Ошибка уже установлена
+    }
+    
+    PyObject *ops_list = PyList_New(op_count);
+    if (!ops_list) {
+        PyMem_Free(ops);
         return NULL;
     }
-    for (Py_ssize_t i = 0; i + 1 < count; i++) {
-        PyObject *prev = PyList_GetItem(steps, i);
-        PyObject *curr = PyList_GetItem(steps, i + 1);
-        if (!PyUnicode_Check(prev) || !PyUnicode_Check(curr)) {
-            PyErr_SetString(PyExc_TypeError, "steps must be list of strings");
-            Py_DECREF(ops);
+    
+    for (Py_ssize_t i = 0; i < op_count; i++) {
+        PyObject *t = op_to_tuple(&ops[i]);
+        if (!t) {
+            Py_DECREF(ops_list);
+            PyMem_Free(ops);
             return NULL;
         }
-        Py_ssize_t prev_len = PyUnicode_GetLength(prev);
-        Py_ssize_t curr_len = PyUnicode_GetLength(curr);
-        PyObject *tuple = NULL;
-        if (curr_len == prev_len) {
-            int is_reverse = 1;
-            for (Py_ssize_t j = 0; j < curr_len; j++) {
-                if (PyUnicode_ReadChar(curr, j) != PyUnicode_ReadChar(prev, curr_len - 1 - j)) {
-                    is_reverse = 0;
-                    break;
-                }
-            }
-            if (is_reverse) {
-                PyObject *name = PyUnicode_FromString("reverse");
-                if (!name) {
-                    Py_DECREF(ops);
-                    return NULL;
-                }
-                tuple = PyTuple_Pack(1, name);
-                Py_DECREF(name);
-            } else {
-                Py_ssize_t diff1 = -1;
-                Py_ssize_t diff2 = -1;
-                int diff_count = 0;
-                for (Py_ssize_t j = 0; j < curr_len; j++) {
-                    if (PyUnicode_ReadChar(curr, j) != PyUnicode_ReadChar(prev, j)) {
-                        diff_count += 1;
-                        if (diff1 < 0) diff1 = j;
-                        else if (diff2 < 0) diff2 = j;
-                    }
-                }
-                if (diff_count == 2 && diff1 >= 0 && diff2 >= 0) {
-                    Py_UCS4 a1 = PyUnicode_ReadChar(prev, diff1);
-                    Py_UCS4 a2 = PyUnicode_ReadChar(prev, diff2);
-                    if (PyUnicode_ReadChar(curr, diff1) == a2 && PyUnicode_ReadChar(curr, diff2) == a1) {
-                        PyObject *name = PyUnicode_FromString("swap");
-                        PyObject *iobj = PyLong_FromSsize_t(diff1);
-                        PyObject *jobj = PyLong_FromSsize_t(diff2);
-                        if (!name || !iobj || !jobj) {
-                            Py_XDECREF(name);
-                            Py_XDECREF(iobj);
-                            Py_XDECREF(jobj);
-                            Py_DECREF(ops);
-                            return NULL;
-                        }
-                        tuple = PyTuple_Pack(3, name, iobj, jobj);
-                        Py_DECREF(name);
-                        Py_DECREF(iobj);
-                        Py_DECREF(jobj);
-                    }
-                }
-            }
-        }
-        if (!tuple && curr_len > prev_len) {
-            Py_ssize_t j;
-            for (j = 0; j < curr_len; j++) {
-                if (j >= prev_len || PyUnicode_ReadChar(curr, j) != PyUnicode_ReadChar(prev, j)) {
-                    Py_UCS4 ch = PyUnicode_ReadChar(curr, j);
-                    PyObject *name = PyUnicode_FromString("insert");
-                    PyObject *chobj = PyUnicode_FromKindAndData(PyUnicode_4BYTE_KIND, &ch, 1);
-                    if (!name || !chobj) {
-                        Py_XDECREF(name);
-                        Py_XDECREF(chobj);
-                        Py_DECREF(ops);
-                        return NULL;
-                    }
-                    tuple = PyTuple_Pack(2, name, chobj);
-                    Py_DECREF(name);
-                    Py_DECREF(chobj);
-                    break;
-                }
-            }
-        } else if (!tuple && curr_len < prev_len) {
-            Py_ssize_t j;
-            for (j = 0; j < prev_len; j++) {
-                if (j >= curr_len || PyUnicode_ReadChar(curr, j) != PyUnicode_ReadChar(prev, j)) {
-                    Py_UCS4 ch = PyUnicode_ReadChar(prev, j);
-                    PyObject *name = PyUnicode_FromString("delete");
-                    PyObject *chobj = PyUnicode_FromKindAndData(PyUnicode_4BYTE_KIND, &ch, 1);
-                    if (!name || !chobj) {
-                        Py_XDECREF(name);
-                        Py_XDECREF(chobj);
-                        Py_DECREF(ops);
-                        return NULL;
-                    }
-                    tuple = PyTuple_Pack(2, name, chobj);
-                    Py_DECREF(name);
-                    Py_DECREF(chobj);
-                    break;
-                }
-            }
-        } else if (!tuple) {
-            int diff_found = 0;
-            for (Py_ssize_t j = 0; j < curr_len; j++) {
-                Py_UCS4 c1 = PyUnicode_ReadChar(curr, j);
-                Py_UCS4 c2 = PyUnicode_ReadChar(prev, j);
-                if (c1 != c2) {
-                    PyObject *name = PyUnicode_FromString("replace");
-                    PyObject *oldc = PyUnicode_FromKindAndData(PyUnicode_4BYTE_KIND, &c2, 1);
-                    PyObject *newc = PyUnicode_FromKindAndData(PyUnicode_4BYTE_KIND, &c1, 1);
-                    if (!name || !oldc || !newc) {
-                        Py_XDECREF(name);
-                        Py_XDECREF(oldc);
-                        Py_XDECREF(newc);
-                        Py_DECREF(ops);
-                        return NULL;
-                    }
-                    tuple = PyTuple_Pack(3, name, oldc, newc);
-                    Py_DECREF(name);
-                    Py_DECREF(oldc);
-                    Py_DECREF(newc);
-                    diff_found = 1;
-                    break;
-                }
-            }
-            if (!diff_found) {
-                PyObject *name = PyUnicode_FromString("match");
-                PyObject *chobj = NULL;
-                if (curr_len > 0) {
-                    Py_UCS4 ch = PyUnicode_ReadChar(curr, 0);
-                    chobj = PyUnicode_FromKindAndData(PyUnicode_4BYTE_KIND, &ch, 1);
-                } else {
-                    chobj = PyUnicode_New(0, 0);
-                }
-                if (!name || !chobj) {
-                    Py_XDECREF(name);
-                    Py_XDECREF(chobj);
-                    Py_DECREF(ops);
-                    return NULL;
-                }
-                tuple = PyTuple_Pack(2, name, chobj);
-                Py_DECREF(name);
-                Py_DECREF(chobj);
-            }
-        }
-
-        if (!tuple) {
-            PyErr_SetString(PyExc_RuntimeError, "Failed to build operation tuple");
-            Py_DECREF(ops);
-            return NULL;
-        }
-        if (PyList_Append(ops, tuple) < 0) {
-            Py_DECREF(tuple);
-            Py_DECREF(ops);
-            return NULL;
-        }
-        Py_DECREF(tuple);
+        PyList_SET_ITEM(ops_list, i, t);
     }
-    return ops;
+    
+    PyMem_Free(ops);
+    return ops_list;
 }
 
 static int
@@ -425,6 +339,12 @@ compute_dp(const Py_UCS4 *a, Py_ssize_t m, const Py_UCS4 *b, Py_ssize_t n, int *
                 int min = del;
                 if (ins < min) min = ins;
                 if (rep < min) min = rep;
+
+                if (i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1]) {
+                    int swap_cost = dp[(i - 2) * (n + 1) + (j - 2)] + 1;
+                    if (swap_cost < min) min = swap_cost;
+                }
+                
                 dp[i * (n + 1) + j] = min;
             }
         }
@@ -444,27 +364,35 @@ reverse_ops_from_dp(const Py_UCS4 *a, Py_ssize_t m, const Py_UCS4 *b, Py_ssize_t
     Py_ssize_t count = 0;
     Py_ssize_t i = m;
     Py_ssize_t j = n;
+    Py_ssize_t pos = m; 
     while (i > 0 || j > 0) {
         if (i > 0 && j > 0 && a[i - 1] == b[j - 1]) {
-            ops[count++] = (Op){OP_MATCH, a[i - 1], 0};
+            ops[count++] = (Op){OP_MATCH, a[i - 1], 0, 0};
             i -= 1;
             j -= 1;
+            pos -= 1;  
+        } else if (i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] && 
+                   dp[i * (n + 1) + j] == dp[(i - 2) * (n + 1) + (j - 2)] + 1) {
+            ops[count++] = (Op){OP_SWAP, 0, 0, pos - 2}; 
+            i -= 2;
+            j -= 2;
+            pos -= 2;  
+        } else if (i > 0 && j > 0 && dp[i * (n + 1) + j] == dp[(i - 1) * (n + 1) + (j - 1)] + 1) {
+            ops[count++] = (Op){OP_REPLACE, a[i - 1], b[j - 1], pos - 1};
+            i -= 1;
+            j -= 1;
+            pos -= 1;
+        } else if (j > 0 && dp[i * (n + 1) + j] == dp[i * (n + 1) + (j - 1)] + 1) {
+            ops[count++] = (Op){OP_INSERT, 0, b[j - 1], pos};
+            j -= 1;
+        } else if (i > 0 && dp[i * (n + 1) + j] == dp[(i - 1) * (n + 1) + j] + 1) {
+            ops[count++] = (Op){OP_DELETE, a[i - 1], 0, pos - 1};
+            i -= 1;
+            pos -= 1;  
         } else {
-            if (i > 0 && j > 0 && dp[i * (n + 1) + j] == dp[(i - 1) * (n + 1) + (j - 1)] + 1) {
-                ops[count++] = (Op){OP_REPLACE, a[i - 1], b[j - 1]};
-                i -= 1;
-                j -= 1;
-            } else if (j > 0 && dp[i * (n + 1) + j] == dp[i * (n + 1) + (j - 1)] + 1) {
-                ops[count++] = (Op){OP_INSERT, 0, b[j - 1]};
-                j -= 1;
-            } else if (i > 0 && dp[i * (n + 1) + j] == dp[(i - 1) * (n + 1) + j] + 1) {
-                ops[count++] = (Op){OP_DELETE, a[i - 1], 0};
-                i -= 1;
-            } else {
-                PyMem_Free(ops);
-                PyErr_SetString(PyExc_RuntimeError, "Failed to reconstruct operations");
-                return NULL;
-            }
+            PyMem_Free(ops);
+            PyErr_SetString(PyExc_RuntimeError, "Failed to reconstruct operations");
+            return NULL;
         }
     }
     for (Py_ssize_t k = 0; k < count / 2; k++) {
@@ -481,12 +409,139 @@ reverse_ops_from_dp(const Py_UCS4 *a, Py_ssize_t m, const Py_UCS4 *b, Py_ssize_t
     return capsule;
 }
 
+
+
+
 static void
 free_ops_capsule(PyObject *capsule) {
     Op *ops = (Op *)PyCapsule_GetPointer(capsule, "ops");
     if (ops) {
         PyMem_Free(ops);
     }
+}
+
+
+
+static Op *
+build_operations_from_steps_internal(PyObject *steps, Py_ssize_t *out_len) {
+    Py_ssize_t count = PyList_Size(steps);
+    if (count <= 0) {
+        *out_len = 0;
+        return NULL;
+    }
+    
+    // Максимальное количество операций = count - 1
+    Op *ops = (Op *)PyMem_Malloc(sizeof(Op) * (size_t)(count - 1));
+    if (!ops) {
+        PyErr_NoMemory();
+        return NULL;
+    }
+    
+    Py_ssize_t op_count = 0;
+    
+    for (Py_ssize_t i = 0; i + 1 < count; i++) {
+        PyObject *prev = PyList_GetItem(steps, i);
+        PyObject *curr = PyList_GetItem(steps, i + 1);
+        
+        if (!PyUnicode_Check(prev) || !PyUnicode_Check(curr)) {
+            PyErr_SetString(PyExc_TypeError, "steps must be list of strings");
+            PyMem_Free(ops);
+            return NULL;
+        }
+        
+        Py_ssize_t prev_len = PyUnicode_GetLength(prev);
+        Py_ssize_t curr_len = PyUnicode_GetLength(curr);
+        
+        // Проверяем swap (меняются местами два соседних символа)
+        if (curr_len == prev_len) {
+            // Ищем позицию, где начинается различие
+            Py_ssize_t diff_pos = -1;
+            for (Py_ssize_t j = 0; j < curr_len; j++) {
+                if (PyUnicode_ReadChar(curr, j) != PyUnicode_ReadChar(prev, j)) {
+                    diff_pos = j;
+                    break;
+                }
+            }
+            
+            if (diff_pos != -1 && diff_pos + 1 < curr_len) {
+                // Проверяем swap двух соседних символов
+                if (PyUnicode_ReadChar(curr, diff_pos) == PyUnicode_ReadChar(prev, diff_pos + 1) &&
+                    PyUnicode_ReadChar(curr, diff_pos + 1) == PyUnicode_ReadChar(prev, diff_pos)) {
+                    // Проверяем, что остальные символы совпадают
+                    int is_swap = 1;
+                    for (Py_ssize_t j = 0; j < curr_len; j++) {
+                        if (j != diff_pos && j != diff_pos + 1) {
+                            if (PyUnicode_ReadChar(curr, j) != PyUnicode_ReadChar(prev, j)) {
+                                is_swap = 0;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    if (is_swap) {
+                        ops[op_count++] = (Op){OP_SWAP, 0, 0, diff_pos};
+                        continue;
+                    }
+                }
+            }
+            
+            // Проверяем reverse (вся строка перевернута)
+            int is_reverse = 1;
+            for (Py_ssize_t j = 0; j < curr_len; j++) {
+                if (PyUnicode_ReadChar(curr, j) != PyUnicode_ReadChar(prev, curr_len - 1 - j)) {
+                    is_reverse = 0;
+                    break;
+                }
+            }
+            
+            if (is_reverse) {
+                // Для reverse создаем серию swap операций
+                for (Py_ssize_t k = 0; k < curr_len / 2; k++) {
+                    ops[op_count++] = (Op){OP_SWAP, 0, 0, k};
+                }
+                continue;
+            }
+        }
+        
+        // Если не swap и не reverse, используем существующую логику
+        if (curr_len > prev_len) {
+            Py_ssize_t j;
+            for (j = 0; j < curr_len; j++) {
+                if (j >= prev_len || PyUnicode_ReadChar(curr, j) != PyUnicode_ReadChar(prev, j)) {
+                    Py_UCS4 ch = PyUnicode_ReadChar(curr, j);
+                    ops[op_count++] = (Op){OP_INSERT, 0, ch, 0};
+                    break;
+                }
+            }
+        } else if (curr_len < prev_len) {
+            Py_ssize_t j;
+            for (j = 0; j < prev_len; j++) {
+                if (j >= curr_len || PyUnicode_ReadChar(curr, j) != PyUnicode_ReadChar(prev, j)) {
+                    Py_UCS4 ch = PyUnicode_ReadChar(prev, j);
+                    ops[op_count++] = (Op){OP_DELETE, ch, 0, 0};
+                    break;
+                }
+            }
+        } else {
+            int diff_found = 0;
+            for (Py_ssize_t j = 0; j < curr_len; j++) {
+                Py_UCS4 c1 = PyUnicode_ReadChar(curr, j);
+                Py_UCS4 c2 = PyUnicode_ReadChar(prev, j);
+                if (c1 != c2) {
+                    ops[op_count++] = (Op){OP_REPLACE, c2, c1, 0};
+                    diff_found = 1;
+                    break;
+                }
+            }
+            if (!diff_found) {
+                Py_UCS4 ch = (curr_len > 0) ? PyUnicode_ReadChar(curr, 0) : 0;
+                ops[op_count++] = (Op){OP_MATCH, ch, 0, 0};
+            }
+        }
+    }
+    
+    *out_len = op_count;
+    return ops;
 }
 
 static PyObject *
@@ -636,6 +691,7 @@ static void seqbuf_dec(SeqBuf *sb) {
 static SeqBuf *seqbuf_apply(const SeqBuf *src, OpType type, Py_UCS4 b, Py_ssize_t pos, Py_ssize_t *out_pos) {
     if (type == OP_MATCH) {
         *out_pos = pos + 1;
+        seqbuf_inc((SeqBuf *)src);  
         return (SeqBuf *)src;
     }
     if (type == OP_REPLACE) {
@@ -677,6 +733,17 @@ static SeqBuf *seqbuf_apply(const SeqBuf *src, OpType type, Py_UCS4 b, Py_ssize_
         sb->len = src->len - 1;
         sb->refcnt = 1;
         *out_pos = pos;
+        return sb;
+    }
+    if (type == OP_SWAP) {  
+        // FIXED: Use pos instead of swap_i
+        if (pos < 0 || pos + 1 >= src->len) return NULL;
+        SeqBuf *sb = seqbuf_new(src->data, src->len);
+        if (!sb) return NULL;
+        Py_UCS4 tmp = sb->data[pos];
+        sb->data[pos] = sb->data[pos + 1];
+        sb->data[pos + 1] = tmp;
+        *out_pos = pos + 2; 
         return sb;
     }
     return NULL;
@@ -898,6 +965,7 @@ try_steps_with_validator(const SearchCtx *ctx, const Op *ops, Py_ssize_t ops_len
             Py_DECREF(chain);
             i += 1;
         } else if (op.type == OP_INSERT) {
+            // FIXED: Use i instead of op.i
             if (i < 0 || i > cur_len) {
                 Py_DECREF(steps);
                 PyMem_Free(current);
@@ -995,6 +1063,7 @@ try_steps_with_validator(const SearchCtx *ctx, const Op *ops, Py_ssize_t ops_len
                 return NULL;
             }
             Py_DECREF(chain);
+            // i stays
         }
     }
 
@@ -1054,7 +1123,15 @@ validate_ops_prefix(SearchCtx *ctx, const Op *ops, Py_ssize_t ops_len,
         }
 
         Py_ssize_t new_pos = pos;
-        SeqBuf *next = seqbuf_apply(cur, op.type, op.b, pos, &new_pos);
+        SeqBuf *next = NULL;
+
+        // FIXED: Ignore op.i, use pos
+        if (op.type == OP_SWAP) {
+            next = seqbuf_apply(cur, op.type, 0, pos, &new_pos);
+        } else {
+            next = seqbuf_apply(cur, op.type, op.b, pos, &new_pos);
+        }
+        
         if (!next) {
             Py_DECREF(steps);
             seqbuf_dec(cur);
@@ -1125,6 +1202,10 @@ validate_ops_prefix(SearchCtx *ctx, const Op *ops, Py_ssize_t ops_len,
             j += 1;
         } else if (op.type == OP_DELETE) {
             i += 1;
+        } else if (op.type == OP_SWAP) {  
+            // FIXED: Swap consumes 2 chars
+            i += 2;
+            j += 2;
         }
         pos = new_pos;
         g += 1;
@@ -1189,6 +1270,7 @@ build_chain_from_ops(const Op *ops, Py_ssize_t ops_len, const Py_UCS4 *a, Py_ssi
             buf[pos] = op.b;
             pos += 1;
         } else if (op.type == OP_INSERT) {
+            // FIXED: Use pos instead of op.i
             if (pos < 0 || pos > cur_len) {
                 PyMem_Free(buf);
                 PyErr_SetString(PyExc_RuntimeError, "Insert index out of range");
@@ -1206,6 +1288,17 @@ build_chain_from_ops(const Op *ops, Py_ssize_t ops_len, const Py_UCS4 *a, Py_ssi
             }
             memmove(buf + pos, buf + pos + 1, sizeof(Py_UCS4) * (size_t)(cur_len - pos - 1));
             cur_len -= 1;
+        } else if (op.type == OP_SWAP) {  
+            // FIXED: Use pos instead of op.i
+            if (pos < 0 || pos + 1 >= cur_len) {
+                PyMem_Free(buf);
+                PyErr_SetString(PyExc_RuntimeError, "Swap index out of range");
+                return NULL;
+            }
+            Py_UCS4 tmp = buf[pos];
+            buf[pos] = buf[pos + 1];
+            buf[pos + 1] = tmp;
+            pos += 2;
         }
     }
     PyObject *chain = ucs4_array_to_unicode(buf, cur_len);
@@ -1234,7 +1327,7 @@ best_first_search_from(SearchCtx *ctx, const int *dp, const int *dp_rev, int max
     start.g = start_g;
     start.f = start_g + dp_rev[(ctx->m - start_i) * (ctx->n + 1) + (ctx->n - start_j)];
     start.parent = -1;
-    start.op = (Op){OP_MATCH, 0, 0};
+    start.op = (Op){OP_MATCH, 0, 0, 0};
     start.steps_since_validation = start_steps_since_validation;
     if (!bfq_push_node(&q, start)) {
         bfq_free(&q);
@@ -1283,6 +1376,26 @@ best_first_search_from(SearchCtx *ctx, const int *dp, const int *dp_rev, int max
             PyMem_Free(ops);
             bfq_free(&q);
             return steps;
+        }
+        if (cur.i + 1 < ctx->m && cur.j + 1 < ctx->n && 
+            ctx->a[cur.i] == ctx->b[cur.j + 1] && ctx->a[cur.i + 1] == ctx->b[cur.j]) {
+            BFNode next;
+            next.i = cur.i + 2;
+            next.j = cur.j + 2;
+            next.g = cur.g + 1;
+            int h = dp_rev[(ctx->m - next.i) * (ctx->n + 1) + (ctx->n - next.j)];
+            next.f = next.g + h;
+            if (next.f <= max_dist) {
+                next.parent = cur_idx;
+                next.op = (Op){OP_SWAP, 0, 0, cur.i};
+                next.pos = cur.pos;
+                next.steps_since_validation = cur.steps_since_validation + 1;
+                if (!bfq_push_node(&q, next)) {
+                    bfq_free(&q);
+                    PyErr_NoMemory();
+                    return NULL;
+                }
+            }
         }
 
         if (cur.i < ctx->m && cur.j < ctx->n && ctx->a[cur.i] == ctx->b[cur.j]) {
@@ -1721,7 +1834,7 @@ algo_seq_dynamic_with_validation_run(PyObject *self, PyObject *args, PyObject *k
         Py_ssize_t ci = 0, cj = 0, cpos = 0;
         int cg = 0;
         int cstreak = 0;
-    int rc = validate_ops_prefix(&ctx, ops, ops_len, &prefix_steps, &cur_seq, &ci, &cj, &cpos, &cg, &cstreak);
+        int rc = validate_ops_prefix(&ctx, ops, ops_len, &prefix_steps, &cur_seq, &ci, &cj, &cpos, &cg, &cstreak);
         if (rc < 0) {
             Py_DECREF(ops_capsule);
             Py_XDECREF(validator_to_use);
