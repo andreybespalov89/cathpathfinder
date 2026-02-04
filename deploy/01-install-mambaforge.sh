@@ -2,7 +2,8 @@
 set -euo pipefail
 
 MAMBA_PREFIX=${MAMBA_PREFIX:-"$HOME/mambaforge"}
-INSTALLER_URL=${INSTALLER_URL:-"https://github.com/conda-forge/miniforge/releases/latest/download/Mambaforge-Linux-x86_64.sh"}
+# Mambaforge installers were removed from latest releases; use Miniforge3 instead.
+INSTALLER_URL=${INSTALLER_URL:-"https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh"}
 
 if [[ -x "$MAMBA_PREFIX/bin/mamba" ]]; then
   echo "Mambaforge already installed at $MAMBA_PREFIX"
@@ -14,7 +15,7 @@ mkdir -p "$MAMBA_PREFIX"
 TMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-INSTALLER="$TMP_DIR/Mambaforge-Linux-x86_64.sh"
+INSTALLER="$TMP_DIR/Miniforge3-Linux-x86_64.sh"
 
 curl -fsSL "$INSTALLER_URL" -o "$INSTALLER"
 
