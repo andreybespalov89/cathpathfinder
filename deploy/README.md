@@ -36,6 +36,16 @@ ESMFOLD_CUDA=1 CUDA_VERSION=12.1 bash deploy/02-create-envs.sh
 
 > Если у вас другая версия драйверов, измените `CUDA_VERSION`.
 
+Для воспроизводимости версий ESMFold можно переопределить версии пакетов:
+
+```bash
+ESMFOLD_TORCH_VERSION=2.1.2 \
+ESMFOLD_TORCHVISION_VERSION=0.16.2 \
+ESMFOLD_TORCHAUDIO_VERSION=2.1.2 \
+ESMFOLD_FAIR_ESM_VERSION=2.0.0 \
+bash deploy/02-create-envs.sh
+```
+
 ## 4) Установка локальных пакетов проекта в ssg
 
 ```bash
