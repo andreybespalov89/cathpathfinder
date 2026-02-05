@@ -1,0 +1,18 @@
+services:
+  esmfold:
+    build: .
+    image: datasetgradualstep-esmfold:latest
+    container_name: datasetgradualstep-esmfold
+    volumes:
+      - ./validation_outputs:/app/validation_outputs
+      - ./esmfold_outputs:/app/esmfold_outputs
+    environment:
+      ESMFOLD_FASTA: /app/validation_outputs/new_sequences.fasta
+      ESMFOLD_OUT_DIR: /app/esmfold_outputs
+      ESMFOLD_GPUS: ${ESMFOLD_GPUS:-0}
+      ESMFOLD_BATCH_SIZE: ${ESMFOLD_BATCH_SIZE:-1}
+      ESMFOLD_CHUNK_SIZE: ${ESMFOLD_CHUNK_SIZE:-0}
+      ESMFOLD_SKIP_EXISTING: ${ESMFOLD_SKIP_EXISTING:-1}
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+    runtime: nvidia

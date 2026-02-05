@@ -44,6 +44,45 @@ class Task:
     seq: str
 
 
+def load_esmfold_model():
+    import torch
+    import esm
+
+    try:
+        return esm.pretrained.esmfold_v1()
+    except RuntimeError as exc:
+        msg = str(exc)
+        if "missing" not in msg:
+            raise
+
+    weights_path = os.environ.get("ESMFOLD_WEIGHTS")
+    if not weights_path:
+        torch_home = os.environ.get("TORCH_HOME", os.path.expanduser("~/.cache/torch"))
+        weights_path = os.path.join(torch_home, "hub", "checkpoints", "esmfold_3B_v1.pt")
+    if not os.path.isfile(weights_path):
+        raise FileNotFoundError(f"ESMFold weights not found: {weights_path}")
+
+    model_data = torch.load(weights_path, map_location="cpu")
+    cfg = model_data["cfg"]["model"]
+    model_state = model_data["model"]
+
+    def remap_key(key: str) -> str:
+        prefix = "trunk.structure_module.ipa."
+        for name in ("linear_q_points", "linear_kv_points"):
+            marker = prefix + name + "."
+            if key.startswith(marker) and ".linear." not in key:
+                return marker + "linear." + key[len(marker):]
+        return key
+
+    remapped_state = {remap_key(k): v for k, v in model_state.items()}
+
+    from esm.esmfold.v1.esmfold import ESMFold
+
+    model = ESMFold(esmfold_config=cfg)
+    model.load_state_dict(remapped_state, strict=False)
+    return model
+
+
 def worker_main(
     task_q,
     done_q,
@@ -61,8 +100,10 @@ def worker_main(
 
     print(f"[esmfold] loading model on {device}...", flush=True)
     torch.set_grad_enabled(False)
-    model = esm.pretrained.esmfold_v1()
+    model = load_esmfold_model()
     model = model.eval().to(device)
+    if device == "cpu":
+        model = model.float()
     if chunk_size > 0:
         model.set_chunk_size(chunk_size)
     print(f"[esmfold] model ready on {device}", flush=True)
@@ -142,15 +183,27 @@ def main() -> int:
 
     os.makedirs(args.out_dir, exist_ok=True)
 
+    use_cpu = os.environ.get("ESMFOLD_CPU", "0") == "1"
     gpu_ids = [g.strip() for g in args.gpus.split(",") if g.strip() != ""]
     devices = [f"cuda:{g}" for g in gpu_ids] if gpu_ids else ["cuda:0"]
+    if use_cpu:
+        devices = ["cpu"]
+    else:
+        try:
+            import torch
+
+            if not torch.cuda.is_available():
+                print("[esmfold] CUDA not available, falling back to CPU", file=sys.stderr)
+                devices = ["cpu"]
+        except Exception:
+            pass
 
     if not args.no_preload:
         try:
             import esm
             import torch
             print("[esmfold] preloading weights in main process...", flush=True)
-            model = esm.pretrained.esmfold_v1()
+            model = load_esmfold_model()
             model.eval()
             del model
             if torch.cuda.is_available():

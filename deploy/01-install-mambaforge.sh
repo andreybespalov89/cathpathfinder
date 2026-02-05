@@ -10,8 +10,6 @@ if [[ -x "$MAMBA_PREFIX/bin/mamba" ]]; then
   exit 0
 fi
 
-mkdir -p "$MAMBA_PREFIX"
-
 TMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -19,7 +17,12 @@ INSTALLER="$TMP_DIR/Miniforge3-Linux-x86_64.sh"
 
 curl -fsSL "$INSTALLER_URL" -o "$INSTALLER"
 
-bash "$INSTALLER" -b -p "$MAMBA_PREFIX"
+INSTALL_ARGS=(-b -p "$MAMBA_PREFIX")
+if [[ -d "$MAMBA_PREFIX" ]]; then
+  INSTALL_ARGS+=(-u)
+fi
+
+bash "$INSTALLER" "${INSTALL_ARGS[@]}"
 
 "$MAMBA_PREFIX/bin/conda" config --set auto_activate_base false
 

@@ -1,0 +1,16 @@
+.git
+__pycache__
+*.pyc
+.ipynb_checkpoints
+*.ipynb
+*.zip
+*.tgz
+*.tar
+*.tar.gz
+*.so
+build
+*.egg-info
+esmfold_outputs
+layer_outputs
+validation_outputs
+log.txt
