@@ -55,7 +55,7 @@ def test_algo_center_insert(): #Добавление в центр
     assert (steps == ['ADE', 'ABDE', 'ABCDE']) and (operations[-1][0] == 'insert')
 
 
-def test_algo_swap_1(): #Тест на свап 
+def test_algo_reverse(): #Тест на свап 
     def custom_validator(chain): 
         return True
     a_seq = "AB"
@@ -63,11 +63,19 @@ def test_algo_swap_1(): #Тест на свап
     steps, operations, distance =  dsc.algo_seq_dynamic_with_validation_run(a_seq, b_seq, validator=custom_validator)
     print(steps)
     print(f'Последнее слово:{steps[-1]}')
-    assert (steps == ['AB', 'BA']) and (operations[-1][0] == 'swap')
+    assert (steps == ['AB', 'BA']) and (operations[-1][0] == 'reverse')
 
 def test_single_char(): #Единичная буква
     steps, ops, dist = dsc.algo_seq_dynamic_run("a", "a")
     assert dist == 0
     assert ops == [("match", "a")]
 
-
+def test_algo_reverse_base():
+    def custom_validator(chain): 
+        return True
+    a_seq = "EDADE"
+    b_seq = "EDADE"
+    steps, operations, distance =  dsc.algo_seq_dynamic_with_validation_run(a_seq, b_seq, validator=custom_validator)
+    print(steps)
+    print(operations)
+    assert (distance == 0)

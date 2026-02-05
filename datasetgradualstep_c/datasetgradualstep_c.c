@@ -146,7 +146,7 @@ build_operations_list(const Op *ops, Py_ssize_t count) {
 }
 
 static PyObject *
-build_steps_from_ops(const Py_UCS4 *a, Py_ssize_t a_len, const Op *ops, Py_ssize_t ops_len) {
+build_steps_from_ops(const Py_UCS4 *a, Py_ssize_t a_len, const Op *ops, Py_ssize_t ops_len, Py_ssize_t start_index) {
     Py_UCS4 *current = (Py_UCS4 *)PyMem_Malloc(sizeof(Py_UCS4) * (size_t)(a_len + ops_len + 1));
     if (!current) {
         PyErr_NoMemory();
@@ -174,7 +174,9 @@ build_steps_from_ops(const Py_UCS4 *a, Py_ssize_t a_len, const Op *ops, Py_ssize
     }
     Py_DECREF(initial);
 
-    Py_ssize_t i = 0;
+    // ИСПРАВЛЕНИЕ: Курсор стартует со смещения
+    Py_ssize_t i = start_index;
+
     for (Py_ssize_t k = 0; k < ops_len; k++) {
         Op op = ops[k];
         if (op.type == OP_MATCH) {
@@ -202,7 +204,6 @@ build_steps_from_ops(const Py_UCS4 *a, Py_ssize_t a_len, const Op *ops, Py_ssize
             Py_DECREF(s);
             i += 1;
         } else if (op.type == OP_INSERT) {
-            // FIXED: Use current cursor i instead of static op.i
             Py_ssize_t insert_pos = i;
             if (insert_pos < 0 || insert_pos > cur_len) {
                 PyErr_SetString(PyExc_RuntimeError, "Insert index out of range");
@@ -229,7 +230,7 @@ build_steps_from_ops(const Py_UCS4 *a, Py_ssize_t a_len, const Op *ops, Py_ssize
             }
             Py_DECREF(s);
             
-            i += 1; // Advance cursor past inserted char
+            i += 1; 
         }
         else if (op.type == OP_DELETE) {
             if (i < 0 || i >= cur_len) {
@@ -253,9 +254,8 @@ build_steps_from_ops(const Py_UCS4 *a, Py_ssize_t a_len, const Op *ops, Py_ssize
                 return NULL;
             }
             Py_DECREF(s);
-            // i stays at the same index because the next char moved here
-        }  else if (op.type == OP_SWAP) {
-            // FIXED: Use current cursor i instead of static op.i
+            // i не меняется, так как следующий символ сдвинулся на это место
+        } else if (op.type == OP_SWAP) {
             if (i < 0 || i + 1 >= cur_len) {
                 PyErr_SetString(PyExc_RuntimeError, "Swap index out of range");
                 Py_DECREF(steps);
@@ -278,7 +278,7 @@ build_steps_from_ops(const Py_UCS4 *a, Py_ssize_t a_len, const Op *ops, Py_ssize
                 return NULL;
             }
             Py_DECREF(s);
-            i += 2; // Advance past both swapped chars
+            i += 2; 
         }
     }
 
@@ -291,7 +291,7 @@ build_operations_from_steps(PyObject *steps) {
     Py_ssize_t op_count;
     Op *ops = build_operations_from_steps_internal(steps, &op_count);
     if (!ops && op_count > 0) {
-        return NULL;  // Ошибка уже установлена
+        return NULL; 
     }
     
     PyObject *ops_list = PyList_New(op_count);
@@ -543,6 +543,15 @@ build_operations_from_steps_internal(PyObject *steps, Py_ssize_t *out_len) {
     *out_len = op_count;
     return ops;
 }
+static Py_UCS4 *
+duplicate_and_reverse_ucs4(const Py_UCS4 *src, Py_ssize_t len) {
+    Py_UCS4 *dst = (Py_UCS4 *)PyMem_Malloc(sizeof(Py_UCS4) * (size_t)len);
+    if (!dst) return NULL;
+    for (Py_ssize_t i = 0; i < len; i++) {
+        dst[i] = src[len - 1 - i];
+    }
+    return dst;
+}
 
 static PyObject *
 algo_seq_dynamic_run(PyObject *self, PyObject *args) {
@@ -570,6 +579,38 @@ algo_seq_dynamic_run(PyObject *self, PyObject *args) {
         PyMem_Free(b);
         return NULL;
     }
+    int dist_normal = dp[m * (n + 1) + n];
+
+    int used_reverse = 0;
+    Py_UCS4 *a_rev = duplicate_and_reverse_ucs4(a, m);
+    if (!a_rev) {
+        PyMem_Free(a);
+        PyMem_Free(b);
+        PyMem_Free(dp);
+        return NULL;
+    }
+
+    int *dp_rev_check = NULL;
+    if (compute_dp(a_rev, m, b, n, &dp_rev_check) < 0) {
+        PyMem_Free(a_rev);
+        PyMem_Free(a);
+        PyMem_Free(b);
+        PyMem_Free(dp);
+        return NULL;
+    }
+    int dist_reverse = dp_rev_check[m * (n + 1) + n];
+
+    
+    if (dist_reverse < dist_normal) {
+        used_reverse = 1;
+        PyMem_Free(dp);      
+        PyMem_Free(a);       
+        dp = dp_rev_check;   
+        a = a_rev;           
+    } else {
+        PyMem_Free(dp_rev_check);
+        PyMem_Free(a_rev);
+    }
 
     Py_ssize_t ops_len = 0;
     PyObject *ops_capsule = reverse_ops_from_dp(a, m, b, n, dp, &ops_len);
@@ -589,7 +630,7 @@ algo_seq_dynamic_run(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    PyObject *steps = build_steps_from_ops(a, m, ops, ops_len);
+    PyObject *steps = build_steps_from_ops(a, m, ops, ops_len, 0);
     if (!steps) {
         Py_DECREF(ops_capsule);
         PyMem_Free(a);
@@ -607,9 +648,46 @@ algo_seq_dynamic_run(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    int min_dist = dp[m * (n + 1) + n];
+    int final_dist = dp[m * (n + 1) + n];
 
-    PyObject *dist_obj = PyLong_FromLong(min_dist);
+    // 4. Если использовался реверс, добавляем информацию об этом в начало списков
+    if (used_reverse) {
+        // Добавляем исходную (не перевернутую) строку в начало списка steps
+        if (PyList_Insert(steps, 0, a_obj) < 0) {
+            // Ошибка вставки, очистка сложная, возвращаем NULL
+            Py_DECREF(steps);
+            Py_DECREF(ops_list);
+            free_ops_capsule(ops_capsule);
+            Py_DECREF(ops_capsule);
+            PyMem_Free(a);
+            PyMem_Free(b);
+            PyMem_Free(dp);
+            return NULL;
+        }
+
+        // Создаем кортеж ('reverse', a_obj) и вставляем в начало ops_list
+        PyObject *rev_name = PyUnicode_FromString("reverse");
+        PyObject *rev_op = PyTuple_Pack(2, rev_name, a_obj);
+        Py_DECREF(rev_name);
+        
+        if (PyList_Insert(ops_list, 0, rev_op) < 0) {
+            Py_DECREF(rev_op);
+            Py_DECREF(steps);
+            Py_DECREF(ops_list);
+            free_ops_capsule(ops_capsule);
+            Py_DECREF(ops_capsule);
+            PyMem_Free(a);
+            PyMem_Free(b);
+            PyMem_Free(dp);
+            return NULL;
+        }
+        Py_DECREF(rev_op);
+        
+        // Увеличиваем дистанцию на 1 (цена операции reverse)
+        final_dist += 1;
+    }
+
+    PyObject *dist_obj = PyLong_FromLong(final_dist);
     if (!dist_obj) {
         Py_DECREF(steps);
         Py_DECREF(ops_list);
@@ -1246,9 +1324,8 @@ merge_steps(PyObject *prefix, PyObject *suffix) {
     }
     return out;
 }
-
 static PyObject *
-build_chain_from_ops(const Op *ops, Py_ssize_t ops_len, const Py_UCS4 *a, Py_ssize_t m) {
+build_chain_from_ops(const Op *ops, Py_ssize_t ops_len, const Py_UCS4 *a, Py_ssize_t m, Py_ssize_t start_index) {
     Py_UCS4 *buf = (Py_UCS4 *)PyMem_Malloc(sizeof(Py_UCS4) * (size_t)(m + ops_len + 1));
     if (!buf) {
         PyErr_NoMemory();
@@ -1256,7 +1333,10 @@ build_chain_from_ops(const Op *ops, Py_ssize_t ops_len, const Py_UCS4 *a, Py_ssi
     }
     memcpy(buf, a, sizeof(Py_UCS4) * (size_t)m);
     Py_ssize_t cur_len = m;
-    Py_ssize_t pos = 0;
+    
+    // ИСПРАВЛЕНИЕ: Курсор стартует со смещения
+    Py_ssize_t pos = start_index;
+
     for (Py_ssize_t k = 0; k < ops_len; k++) {
         Op op = ops[k];
         if (op.type == OP_MATCH) {
@@ -1270,7 +1350,6 @@ build_chain_from_ops(const Op *ops, Py_ssize_t ops_len, const Py_UCS4 *a, Py_ssi
             buf[pos] = op.b;
             pos += 1;
         } else if (op.type == OP_INSERT) {
-            // FIXED: Use pos instead of op.i
             if (pos < 0 || pos > cur_len) {
                 PyMem_Free(buf);
                 PyErr_SetString(PyExc_RuntimeError, "Insert index out of range");
@@ -1289,7 +1368,6 @@ build_chain_from_ops(const Op *ops, Py_ssize_t ops_len, const Py_UCS4 *a, Py_ssi
             memmove(buf + pos, buf + pos + 1, sizeof(Py_UCS4) * (size_t)(cur_len - pos - 1));
             cur_len -= 1;
         } else if (op.type == OP_SWAP) {  
-            // FIXED: Use pos instead of op.i
             if (pos < 0 || pos + 1 >= cur_len) {
                 PyMem_Free(buf);
                 PyErr_SetString(PyExc_RuntimeError, "Swap index out of range");
@@ -1306,10 +1384,12 @@ build_chain_from_ops(const Op *ops, Py_ssize_t ops_len, const Py_UCS4 *a, Py_ssi
     return chain;
 }
 
+
 static PyObject *
 best_first_search_from(SearchCtx *ctx, const int *dp, const int *dp_rev, int max_extra,
                        Py_ssize_t start_i, Py_ssize_t start_j, Py_ssize_t start_pos,
-                       int start_g, int start_steps_since_validation) {
+                       int start_g, int start_steps_since_validation,
+                       const Py_UCS4 *start_seq, Py_ssize_t start_len) {
     int min_dist = dp[ctx->m * (ctx->n + 1) + ctx->n];
     int max_dist = min_dist + max_extra;
 
@@ -1355,6 +1435,7 @@ best_first_search_from(SearchCtx *ctx, const int *dp, const int *dp_rev, int max
         if (ctx->max_nodes > 0 && ctx->nodes_visited >= ctx->max_nodes) break;
         if (cur.f > max_dist) continue;
 
+        // --- SUCCESS CASE ---
         if (cur.i == ctx->m && cur.j == ctx->n) {
             Py_ssize_t steps_len = 0;
             for (int t = cur_idx; t >= 0; t = q.nodes[t].parent) {
@@ -1372,11 +1453,15 @@ best_first_search_from(SearchCtx *ctx, const int *dp, const int *dp_rev, int max
                 if (q.nodes[t].parent < 0) break;
                 ops[--idx] = q.nodes[t].op;
             }
-            PyObject *steps = build_steps_from_ops(ctx->a, ctx->m, ops, steps_len - 1);
+            
+            PyObject *steps = build_steps_from_ops(start_seq, start_len, ops, steps_len - 1, start_pos);
+            
             PyMem_Free(ops);
             bfq_free(&q);
             return steps;
         }
+        
+        // --- SWAP ---
         if (cur.i + 1 < ctx->m && cur.j + 1 < ctx->n && 
             ctx->a[cur.i] == ctx->b[cur.j + 1] && ctx->a[cur.i + 1] == ctx->b[cur.j]) {
             BFNode next;
@@ -1388,7 +1473,7 @@ best_first_search_from(SearchCtx *ctx, const int *dp, const int *dp_rev, int max
             if (next.f <= max_dist) {
                 next.parent = cur_idx;
                 next.op = (Op){OP_SWAP, 0, 0, cur.i};
-                next.pos = cur.pos;
+                next.pos = cur.pos + 2; // FIX: +2
                 next.steps_since_validation = cur.steps_since_validation + 1;
                 if (!bfq_push_node(&q, next)) {
                     bfq_free(&q);
@@ -1398,6 +1483,7 @@ best_first_search_from(SearchCtx *ctx, const int *dp, const int *dp_rev, int max
             }
         }
 
+        // --- MATCH ---
         if (cur.i < ctx->m && cur.j < ctx->n && ctx->a[cur.i] == ctx->b[cur.j]) {
             BFNode next;
             next.i = cur.i + 1;
@@ -1418,6 +1504,7 @@ best_first_search_from(SearchCtx *ctx, const int *dp, const int *dp_rev, int max
             }
         }
 
+        // --- REPLACE ---
         if (cur.i < ctx->m && cur.j < ctx->n) {
             Py_ssize_t new_pos = cur.pos + 1;
             int next_steps = cur.steps_since_validation + 1;
@@ -1433,13 +1520,16 @@ best_first_search_from(SearchCtx *ctx, const int *dp, const int *dp_rev, int max
                     PyErr_NoMemory();
                     return NULL;
                 }
-                Py_ssize_t idx = steps_len;
+                // FIX: idx starts at steps_len - 1
+                Py_ssize_t idx = steps_len - 1;
                 for (int t = cur_idx; t >= 0; t = q.nodes[t].parent) {
                     if (q.nodes[t].parent < 0) break;
                     ops[--idx] = q.nodes[t].op;
                 }
                 ops[steps_len - 1] = (Op){OP_REPLACE, ctx->a[cur.i], ctx->b[cur.j]};
-                PyObject *chain = build_chain_from_ops(ops, steps_len, ctx->a, ctx->m);
+                
+                PyObject *chain = build_chain_from_ops(ops, steps_len, start_seq, start_len, start_pos);
+                
                 PyMem_Free(ops);
                 if (!chain) {
                     bfq_free(&q);
@@ -1480,6 +1570,7 @@ best_first_search_from(SearchCtx *ctx, const int *dp, const int *dp_rev, int max
         }
         skip_replace:
 
+        // --- INSERT ---
         if (cur.j < ctx->n) {
             Py_ssize_t new_pos = cur.pos + 1;
             int next_steps = cur.steps_since_validation + 1;
@@ -1495,13 +1586,16 @@ best_first_search_from(SearchCtx *ctx, const int *dp, const int *dp_rev, int max
                     PyErr_NoMemory();
                     return NULL;
                 }
-                Py_ssize_t idx = steps_len;
+                // FIX: idx starts at steps_len - 1
+                Py_ssize_t idx = steps_len - 1;
                 for (int t = cur_idx; t >= 0; t = q.nodes[t].parent) {
                     if (q.nodes[t].parent < 0) break;
                     ops[--idx] = q.nodes[t].op;
                 }
                 ops[steps_len - 1] = (Op){OP_INSERT, 0, ctx->b[cur.j]};
-                PyObject *chain = build_chain_from_ops(ops, steps_len, ctx->a, ctx->m);
+                
+                PyObject *chain = build_chain_from_ops(ops, steps_len, start_seq, start_len, start_pos);
+                
                 PyMem_Free(ops);
                 if (!chain) {
                     bfq_free(&q);
@@ -1542,6 +1636,7 @@ best_first_search_from(SearchCtx *ctx, const int *dp, const int *dp_rev, int max
         }
         skip_insert:
 
+        // --- DELETE ---
         if (cur.i < ctx->m) {
             Py_ssize_t new_pos = cur.pos;
             int next_steps = cur.steps_since_validation + 1;
@@ -1557,13 +1652,16 @@ best_first_search_from(SearchCtx *ctx, const int *dp, const int *dp_rev, int max
                     PyErr_NoMemory();
                     return NULL;
                 }
-                Py_ssize_t idx = steps_len;
+                // FIX: idx starts at steps_len - 1
+                Py_ssize_t idx = steps_len - 1;
                 for (int t = cur_idx; t >= 0; t = q.nodes[t].parent) {
                     if (q.nodes[t].parent < 0) break;
                     ops[--idx] = q.nodes[t].op;
                 }
                 ops[steps_len - 1] = (Op){OP_DELETE, ctx->a[cur.i], 0};
-                PyObject *chain = build_chain_from_ops(ops, steps_len, ctx->a, ctx->m);
+                
+                PyObject *chain = build_chain_from_ops(ops, steps_len, start_seq, start_len, start_pos);
+                
                 PyMem_Free(ops);
                 if (!chain) {
                     bfq_free(&q);
@@ -1609,6 +1707,12 @@ best_first_search_from(SearchCtx *ctx, const int *dp, const int *dp_rev, int max
     bfq_free(&q);
     return NULL;
 }
+
+
+        
+
+
+    
 
 static int
 search_paths(SearchCtx *ctx, Py_ssize_t i, Py_ssize_t j, Py_ssize_t depth) {
@@ -1704,26 +1808,52 @@ algo_seq_dynamic_with_validation_run(PyObject *self, PyObject *args, PyObject *k
         PyMem_Free(b);
         return NULL;
     }
-    int min_dist = dp[m * (n + 1) + n];
+    int dist_normal = dp[m * (n + 1) + n];
 
-    Py_UCS4 *a_rev = (Py_UCS4 *)PyMem_Malloc(sizeof(Py_UCS4) * (size_t)m);
-    Py_UCS4 *b_rev = (Py_UCS4 *)PyMem_Malloc(sizeof(Py_UCS4) * (size_t)n);
-    if (!a_rev || !b_rev) {
-        PyMem_Free(a_rev);
-        PyMem_Free(b_rev);
+    int used_reverse = 0;
+    Py_UCS4 *a_rev = duplicate_and_reverse_ucs4(a, m);
+    int *dp_rev_check = NULL;
+    
+    if (a_rev) {
+        if (compute_dp(a_rev, m, b, n, &dp_rev_check) == 0) {
+            int dist_reverse = dp_rev_check[m * (n + 1) + n];
+            
+            if (dist_reverse < dist_normal) {
+                used_reverse = 1;
+                PyMem_Free(dp);
+                PyMem_Free(a);
+                dp = dp_rev_check;
+                a = a_rev;
+                dist_normal = dist_reverse; 
+            } else {
+                PyMem_Free(dp_rev_check);
+                PyMem_Free(a_rev);
+            }
+        } else {
+            PyMem_Free(a_rev);
+        }
+    }
+
+    int min_dist = dist_normal;
+
+    Py_UCS4 *a_rev_buf = (Py_UCS4 *)PyMem_Malloc(sizeof(Py_UCS4) * (size_t)m);
+    Py_UCS4 *b_rev_buf = (Py_UCS4 *)PyMem_Malloc(sizeof(Py_UCS4) * (size_t)n);
+    if (!a_rev_buf || !b_rev_buf) {
+        PyMem_Free(a_rev_buf);
+        PyMem_Free(b_rev_buf);
         PyMem_Free(a);
         PyMem_Free(b);
         PyMem_Free(dp);
         PyErr_NoMemory();
         return NULL;
     }
-    for (Py_ssize_t i = 0; i < m; i++) a_rev[i] = a[m - 1 - i];
-    for (Py_ssize_t j = 0; j < n; j++) b_rev[j] = b[n - 1 - j];
+    for (Py_ssize_t i = 0; i < m; i++) a_rev_buf[i] = a[m - 1 - i];
+    for (Py_ssize_t j = 0; j < n; j++) b_rev_buf[j] = b[n - 1 - j];
 
     int *dp_rev = NULL;
-    if (compute_dp(a_rev, m, b_rev, n, &dp_rev) < 0) {
-        PyMem_Free(a_rev);
-        PyMem_Free(b_rev);
+    if (compute_dp(a_rev_buf, m, b_rev_buf, n, &dp_rev) < 0) {
+        PyMem_Free(a_rev_buf);
+        PyMem_Free(b_rev_buf);
         PyMem_Free(a);
         PyMem_Free(b);
         PyMem_Free(dp);
@@ -1796,7 +1926,7 @@ algo_seq_dynamic_with_validation_run(PyObject *self, PyObject *args, PyObject *k
     double t0 = 0.0;
     if (ctx.verbose) {
         t0 = now_seconds();
-        fprintf(stdout, "[dsc] start m=%zd n=%zd min_dist=%d\n", m, n, min_dist);
+        fprintf(stdout, "[dsc] start m=%zd n=%zd min_dist=%d used_reverse=%d\n", m, n, min_dist, used_reverse);
         fflush(stdout);
     }
     ctx.start_time_s = now_seconds();
@@ -1808,8 +1938,8 @@ algo_seq_dynamic_with_validation_run(PyObject *self, PyObject *args, PyObject *k
         PyMem_Free(a);
         PyMem_Free(b);
         PyMem_Free(dp);
-        PyMem_Free(a_rev);
-        PyMem_Free(b_rev);
+        PyMem_Free(a_rev_buf);
+        PyMem_Free(b_rev_buf);
         PyMem_Free(dp_rev);
         return NULL;
     }
@@ -1820,14 +1950,15 @@ algo_seq_dynamic_with_validation_run(PyObject *self, PyObject *args, PyObject *k
         PyMem_Free(a);
         PyMem_Free(b);
         PyMem_Free(dp);
-        PyMem_Free(a_rev);
-        PyMem_Free(b_rev);
+        PyMem_Free(a_rev_buf);
+        PyMem_Free(b_rev_buf);
         PyMem_Free(dp_rev);
         return NULL;
     }
 
     if (!validator_to_use) {
-        steps_found = build_steps_from_ops(a, m, ops, ops_len);
+        // ИСПРАВЛЕНИЕ: offset 0
+        steps_found = build_steps_from_ops(a, m, ops, ops_len, 0);
     } else {
         PyObject *prefix_steps = NULL;
         SeqBuf *cur_seq = NULL;
@@ -1841,8 +1972,8 @@ algo_seq_dynamic_with_validation_run(PyObject *self, PyObject *args, PyObject *k
             PyMem_Free(a);
             PyMem_Free(b);
             PyMem_Free(dp);
-            PyMem_Free(a_rev);
-            PyMem_Free(b_rev);
+            PyMem_Free(a_rev_buf);
+            PyMem_Free(b_rev_buf);
             PyMem_Free(dp_rev);
             return NULL;
         }
@@ -1850,7 +1981,12 @@ algo_seq_dynamic_with_validation_run(PyObject *self, PyObject *args, PyObject *k
             steps_found = prefix_steps;
             seqbuf_dec(cur_seq);
         } else {
-            PyObject *suffix_steps = best_first_search_from(&ctx, dp, dp_rev, 4, ci, cj, cpos, cg, cstreak);
+            // ИСПРАВЛЕНИЕ: Передаем cur_seq и cpos
+            PyObject *suffix_steps = best_first_search_from(
+                &ctx, dp, dp_rev, 4, ci, cj, cpos, cg, cstreak,
+                cur_seq->data, cur_seq->len
+            );
+            
             if (suffix_steps) {
                 steps_found = merge_steps(prefix_steps, suffix_steps);
                 Py_DECREF(suffix_steps);
@@ -1866,8 +2002,8 @@ algo_seq_dynamic_with_validation_run(PyObject *self, PyObject *args, PyObject *k
         PyMem_Free(a);
         PyMem_Free(b);
         PyMem_Free(dp);
-        PyMem_Free(a_rev);
-        PyMem_Free(b_rev);
+        PyMem_Free(a_rev_buf);
+        PyMem_Free(b_rev_buf);
         PyMem_Free(dp_rev);
         return NULL;
     }
@@ -1884,8 +2020,8 @@ algo_seq_dynamic_with_validation_run(PyObject *self, PyObject *args, PyObject *k
     PyMem_Free(a);
     PyMem_Free(b);
     PyMem_Free(dp);
-    PyMem_Free(a_rev);
-    PyMem_Free(b_rev);
+    PyMem_Free(a_rev_buf);
+    PyMem_Free(b_rev_buf);
     PyMem_Free(dp_rev);
 
     if (!steps_found) {
@@ -1898,8 +2034,32 @@ algo_seq_dynamic_with_validation_run(PyObject *self, PyObject *args, PyObject *k
         Py_DECREF(steps_found);
         return NULL;
     }
+
+    if (used_reverse) {
+        if (PyList_Insert(steps_found, 0, a_obj) < 0) {
+            Py_DECREF(steps_found);
+            Py_DECREF(ops_list);
+            return NULL;
+        }
+        PyObject *rev_name = PyUnicode_FromString("reverse");
+        PyObject *rev_op = PyTuple_Pack(2, rev_name, a_obj);
+        Py_DECREF(rev_name);
+        if (PyList_Insert(ops_list, 0, rev_op) < 0) {
+            Py_DECREF(rev_op);
+            Py_DECREF(steps_found);
+            Py_DECREF(ops_list);
+            return NULL;
+        }
+        Py_DECREF(rev_op);
+    }
+
     Py_ssize_t ops_len2 = PyList_Size(ops_list);
     Py_ssize_t dist_weight = 0;
+    
+    if (used_reverse) {
+        dist_weight += 1;
+    }
+
     for (Py_ssize_t i = 0; i < ops_len2; i++) {
         PyObject *op = PyList_GetItem(ops_list, i);
         if (!PyTuple_Check(op) || PyTuple_Size(op) < 1) {
@@ -1909,11 +2069,12 @@ algo_seq_dynamic_with_validation_run(PyObject *self, PyObject *args, PyObject *k
         PyObject *name = PyTuple_GetItem(op, 0);
         if (name && PyUnicode_Check(name)) {
             if (PyUnicode_CompareWithASCIIString(name, "reverse") == 0) {
-                continue;
+                continue; 
             }
         }
         dist_weight += 1;
     }
+
     PyObject *dist_obj = PyLong_FromSsize_t(dist_weight);
     if (!dist_obj) {
         Py_DECREF(steps_found);
@@ -1926,6 +2087,7 @@ algo_seq_dynamic_with_validation_run(PyObject *self, PyObject *args, PyObject *k
     Py_DECREF(ops_list);
     return result;
 }
+
 
 static PyMethodDef module_methods[] = {
     {"algo_seq_dynamic_run", (PyCFunction)algo_seq_dynamic_run, METH_VARARGS, "Run AlgoSeqDynamic on two strings."},

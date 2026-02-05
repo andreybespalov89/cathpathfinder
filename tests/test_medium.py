@@ -1,14 +1,7 @@
 import pytest
 import datasetgradualstep_c as dsc
 
-def test_algo_reverse_medium(): #Тест на реверс
-    def custom_validator(chain):
-        return True
-    a_seq = "ABCDE"
-    b_seq = "EDCBA"
-    steps, operations, distance =  dsc.algo_seq_dynamic_with_validation_run(a_seq, b_seq, validator=custom_validator)
-    print(steps)
-    assert (distance == 4) and (steps == ['ABCDE', 'EDCBA']) and (operations[-1][0] == 'replace')
+
 
 def test_algo_swap_start_medium(): #Тест на свап в конце
     def custom_validator(chain): 
@@ -39,14 +32,14 @@ def test_algo_swap_medium(): #Тест на свап двойной
     print(steps)
     assert (steps == ['ABCDE', 'BACDE', 'BACED']) and (operations[-1][0] == 'swap')
 
-def test_algo_swap_partial_reverse(): #Самое дешевое это три свапа 
+def test_algo_swap_partial_reverse_medium(): #Самое дешевое это три свапа 
     def custom_validator(chain): 
         return True
     a_seq = "ABCDEF"
     b_seq = "BADCFE"
     steps, operations, distance =  dsc.algo_seq_dynamic_with_validation_run(a_seq, b_seq, validator=custom_validator)
     assert distance == 3
-def test_algo_swap_insert():#Свап плюс добавление
+def test_algo_swap_insert_medium():#Свап плюс добавление
     def custom_validator(chain): 
         return True
     a_seq = "BAXX"
@@ -56,7 +49,7 @@ def test_algo_swap_insert():#Свап плюс добавление
     print(operations)
     assert (distance == 2) and (steps == ['', 'BA', 'BAX'])
 
-def test_algo_swap_insert():#Свап плюс добавление
+def test_algo_swap_insert_medium():#Свап плюс добавление
     def custom_validator(chain): 
         return True
     a_seq = "BAXX"
@@ -65,7 +58,7 @@ def test_algo_swap_insert():#Свап плюс добавление
     print(steps)
     print(operations)
     assert (distance == 2) and (steps == ['BAXX', 'ABXX', 'ABXXC'])
-def test_algo_swap_replace():#Свап плюс удаление
+def test_algo_swap_replace_medium():#Свап плюс удаление
     def custom_validator(chain): 
         return True
     a_seq = "ABC"
@@ -75,7 +68,7 @@ def test_algo_swap_replace():#Свап плюс удаление
     print(operations)
     assert (distance == 2) and (steps == ['ABC', 'BAC', 'BAX'])
 
-def test_algo_swap_replace(): #Еще тест на свап
+def test_algo_swap_replace_medium():
     def custom_validator(chain): 
         return True
     a_seq = "XABY"
@@ -85,8 +78,69 @@ def test_algo_swap_replace(): #Еще тест на свап
     print(operations)
     assert (steps == ['XABY', 'XXABY', 'XXBAY'])
 
+def test_algo_swap_medium_3_swap():
+    def custom_validator(chain): 
+        return True
+    a_seq = "XACCCXAXA"
+    b_seq = "AXCCCAXAX"
+    steps, operations, distance =  dsc.algo_seq_dynamic_with_validation_run(a_seq, b_seq, validator=custom_validator)
+    print(steps)
+    print(operations)
+    assert (steps == ['XACCCXAXA', 'AXCCCXAXA', 'AXCCCAXXA', 'AXCCCAXAX'])
 
+
+
+def test_algo_reverse_medium():
+    def custom_validator(chain): 
+        return True
+    a_seq = "ABCDE"
+    b_seq = "EDCBAA"
+    steps, operations, distance =  dsc.algo_seq_dynamic_with_validation_run(a_seq, b_seq, validator=custom_validator)
+    print(steps)
+    print(operations)
+    assert (steps == ['ABCDE', 'EDCBA', 'EDCBAA']) and (operations[0][0] == 'reverse')
 
     
 
+def test_algo_reverse_medium_insert_two():
+    def custom_validator(chain): 
+        return True
+    a_seq = "ABCDE"
+    b_seq = "XEDCBAX"
+    steps, operations, distance =  dsc.algo_seq_dynamic_with_validation_run(a_seq, b_seq, validator=custom_validator)
+    print(steps)
+    print(operations)
+    assert (distance == 3) and (steps == ['ABCDE', 'EDCBA', 'XEDCBA', 'XEDCBAX'])
 
+
+def test_algo_reverse_medium_remove():
+    def custom_validator(chain): 
+        return True
+    a_seq = "ABCDE"
+    b_seq = "EDCB"
+    steps, operations, distance =  dsc.algo_seq_dynamic_with_validation_run(a_seq, b_seq, validator=custom_validator)
+    print(steps)
+    print(operations)
+    assert (distance == 2) and (steps == ['ABCDE', 'EDCBA','EDCB'])
+
+
+
+def test_algo_reverse_medium_and_swap():
+    def custom_validator(chain): 
+        return True
+    a_seq = "ABCDE"
+    b_seq = "ECDBA"
+    steps, operations, distance =  dsc.algo_seq_dynamic_with_validation_run(a_seq, b_seq, validator=custom_validator)
+    print(steps)
+    print(operations)
+    assert (distance == 2) and (steps == ['ABCDE', 'EDCBA', 'ECDBA'])
+
+def test_algo_reverse_medium_and_other_operations():
+    def custom_validator(chain): 
+        return True
+    a_seq = "ABCDE"
+    b_seq = "AECDBAA"
+    steps, operations, distance =  dsc.algo_seq_dynamic_with_validation_run(a_seq, b_seq, validator=custom_validator)
+    print(steps)
+    print(operations)
+    assert  steps == ['ABCDE', 'EDCBA', 'AEDCBA', 'AECDBA', 'AECDBAA']
