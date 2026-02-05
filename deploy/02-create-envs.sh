@@ -22,21 +22,21 @@ mamba env create -f "$ROOT_DIR/deploy/env_ssg.yml" -y
 
 mamba env create -f "$ROOT_DIR/deploy/env_esmfold.yml" -y
 
+conda run -n esmfold python -m pip install --upgrade pip
 if [[ "${ESMFOLD_CUDA:-0}" == "1" ]]; then
   CUDA_VERSION=${CUDA_VERSION:-"12.1"}
-  mamba install -n esmfold --override-channels -c pytorch -c nvidia \
-    "pytorch=${ESMFOLD_TORCH_VERSION}" \
-    "torchvision=${ESMFOLD_TORCHVISION_VERSION}" \
-    "torchaudio=${ESMFOLD_TORCHAUDIO_VERSION}" \
-    "pytorch-cuda=${CUDA_VERSION}" -y
+  conda run -n esmfold python -m pip install \
+    --index-url "https://download.pytorch.org/whl/cu${CUDA_VERSION//./}" \
+    "torch==${ESMFOLD_TORCH_VERSION}+cu${CUDA_VERSION//./}" \
+    "torchvision==${ESMFOLD_TORCHVISION_VERSION}+cu${CUDA_VERSION//./}" \
+    "torchaudio==${ESMFOLD_TORCHAUDIO_VERSION}+cu${CUDA_VERSION//./}"
 else
-  mamba install -n esmfold --override-channels -c pytorch \
-    "pytorch=${ESMFOLD_TORCH_VERSION}" \
-    "torchvision=${ESMFOLD_TORCHVISION_VERSION}" \
-    "torchaudio=${ESMFOLD_TORCHAUDIO_VERSION}" -y
+  conda run -n esmfold python -m pip install \
+    "torch==${ESMFOLD_TORCH_VERSION}" \
+    "torchvision==${ESMFOLD_TORCHVISION_VERSION}" \
+    "torchaudio==${ESMFOLD_TORCHAUDIO_VERSION}"
 fi
-
-conda run -n esmfold python -m pip install --upgrade pip
+conda run -n esmfold python -m pip install "numpy<2"
 conda run -n esmfold python -m pip install "fair-esm==${ESMFOLD_FAIR_ESM_VERSION}"
 conda run -n esmfold python -m pip install omegaconf dm-tree biopython modelcif einops ml-collections scipy
 conda run -n esmfold python -m pip install \
