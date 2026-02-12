@@ -2,3 +2,9 @@ dompdb/
 *.so
 venv/
 __pycache__/
+esmfold_outputs*/
+*outputs/
+trajectory_levels/
+.tmp*
+*.zip
+*.txt
