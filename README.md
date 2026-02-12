@@ -13,3 +13,25 @@
 Greedy Prefix Validation: Алгоритм пытается восстановить кратчайший путь (backtracking) по матрице DP. Полученные промежуточные строки проверяются внешним валидатором (validator(seq) -> bool).
 A Search Recovery:* При обнаружении "невалидного" состояния (валидатор вернул False), алгоритм переключается на поиск Best-First Search (вариация A*).
 Heuristic (h): В качестве эвристической функции h(x) для A* используются предварительно вычисленные значения из матрицы DP (расстояние от текущего состояния до конца). Это гарантирует, что поиск обходного пути направлен к цели и минимизирует количество проверенных узлов.
+
+## Trajectory midpoint generation (ESMFold + RMSD filter)
+
+Генерация структур по траекториям: сначала строятся центральные последовательности, затем центры полученных интервалов, и так далее. Для каждой последовательности генерируется 5 структур, затем выполняется фильтрация по RMSD.
+
+```bash
+python run_trajectory_layers.py \
+  --fasta validation_outputs/new_sequences.fasta \
+  --out-dir trajectory_levels \
+  --gpus 0,1,2,3 \
+  --num-samples 5 \
+  --rmsd-threshold 2.0 \
+  --skip-existing
+```
+
+Слияние всех уровней в один датасет:
+
+```bash
+python merge_trajectory_layers.py \
+  --levels-dir trajectory_levels \
+  --out-dir trajectory_merged
+```
